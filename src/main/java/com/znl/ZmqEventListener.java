@@ -7,6 +7,7 @@ public interface ZmqEventListener {
     default void onResponse(ZmqEvent event) {}
     default void onMessage(ZmqEvent event) {}
     default void onPublish(ZmqEvent event) {}
+    default void onPush(ZmqEvent event) {}
     default void onSlaveConnected(String slaveId) {}
     default void onSlaveDisconnected(String slaveId) {}
     default void onAuthFailed(ZmqEvent event) {}

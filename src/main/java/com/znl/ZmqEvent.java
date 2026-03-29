@@ -5,7 +5,7 @@ import java.util.List;
 public class ZmqEvent {
     private final String channel;
     private final List<byte[]> frames;
-    private final String kind; // request, response, message, heartbeat, register, unregister, pub
+    private final String kind;
     private final String requestId;
     private final String authKey;
     private final List<byte[]> payloadFrames;
@@ -13,10 +13,18 @@ public class ZmqEvent {
     private final byte[] identity;
     private final String identityText;
     private final String topic;
+    private final String authReason;
+    private final boolean encrypted;
 
     public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
                     String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
                     String identityText, String topic) {
+        this(channel, frames, kind, requestId, authKey, payloadFrames, payload, identity, identityText, topic, null, false);
+    }
+
+    public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
+                    String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
+                    String identityText, String topic, String authReason, boolean encrypted) {
         this.channel = channel;
         this.frames = frames;
         this.kind = kind;
@@ -27,6 +35,8 @@ public class ZmqEvent {
         this.identity = identity;
         this.identityText = identityText;
         this.topic = topic;
+        this.authReason = authReason;
+        this.encrypted = encrypted;
     }
 
     public String getChannel() { return channel; }
@@ -39,4 +49,6 @@ public class ZmqEvent {
     public byte[] getIdentity() { return identity; }
     public String getIdentityText() { return identityText; }
     public String getTopic() { return topic; }
+    public String getAuthReason() { return authReason; }
+    public boolean isEncrypted() { return encrypted; }
 }

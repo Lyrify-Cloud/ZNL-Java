@@ -211,9 +211,24 @@ public class SecurityUtils {
     }
 
     public static String digestFrames(List<byte[]> frames) throws Exception {
-        byte[] packed = encodeFrames(frames);
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] hash = md.digest(packed);
+        
+        ByteBuffer head = ByteBuffer.allocate(4);
+        head.putInt(frames == null ? 0 : frames.size());
+        md.update(head.array());
+        
+        if (frames != null) {
+            for (byte[] frame : frames) {
+                ByteBuffer len = ByteBuffer.allocate(4);
+                len.putInt(frame.length);
+                md.update(len.array());
+                if (frame.length > 0) {
+                    md.update(frame);
+                }
+            }
+        }
+        
+        byte[] hash = md.digest();
         return bytesToHex(hash);
     }
 

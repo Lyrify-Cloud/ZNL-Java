@@ -1,15 +1,20 @@
 # ZNL Java
 
-ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC 和 Pub/Sub 通信库，完美兼容原版的 Node.js [ZNL](https://github.com/Lyrify-Cloud/ZNL) 库。
+ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC、Pub/Sub 与 PUSH 通信库，当前与 Node.js [ZNL v0.6.2](https://github.com/Lyrify-Cloud/ZNL) 的协议与恢复语义保持对齐。
 
 ## 特性
 
 - 🚀 **基于 ZeroMQ (ROUTER/DEALER)**：单端口即可实现双向异步通信。
 - 🔒 **端到端加密**：支持 AES-256-GCM 载荷透明加密，HMAC-SHA256 签名认证。
-- 🛡️ **防重放攻击**：基于 nonce 和时间戳的严格防重放保护。
+- 🛡️ **防重放攻击**：支持 `maxTimeSkewMs` 与 `replayWindowMs` 配置。
+- 🔑 **多从节点独立密钥**：Master 支持 `authKeyMap`，可按 `slaveId` 分配不同密钥。
 - 📡 **双端支持**：可作为 Master (ROUTER) 或 Slave (DEALER) 运行。
 - 🔄 **异步 API**：基于 `CompletableFuture`，非阻塞设计。
-- 💓 **自动心跳**：内置心跳与断线检测机制。
+- 📬 **单向 PUSH**：Slave 支持 `PUSH(topic, payload)` 向 Master 无回包上报。
+- 💓 **心跳确认链路**：Slave 使用 `heartbeat -> heartbeat_ack` 维护链路状态。
+- ♻️ **断线自动恢复**：`heartbeat_ack` 超时后会重建 Dealer、取消旧 pending 并重新注册。
+- 📶 **在线状态可观测**：Slave 提供 `isMasterOnline()` 用于读取最近一次链路确认状态。
+- 🧪 **跨语言互通测试**：包含 Java/Node 双向 PUSH、RPC 与恢复相关互通测试。
 
 ## 依赖
 
@@ -27,17 +32,20 @@ ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ
 
 ```java
 import com.znl.*;
+import java.util.concurrent.CompletableFuture;
 
 ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
 options.setRole("master");
 options.setId("master-01");
-options.setAuthKey("your-secret-key"); // 设置相同的密钥
-options.setEncrypted(true);            // 开启加密
+options.setAuthKey("your-secret-key");
+options.setEncrypted(true);
+options.setHeartbeatInterval(3000);
+options.setHeartbeatTimeoutMs(0);
+options.setMaxPending(1000);
 options.getEndpoints().put("router", "tcp://0.0.0.0:6003");
 
 ZmqClusterNode master = new ZmqClusterNode(options);
 
-// 处理来自 Slave 的请求
 master.ROUTER(event -> {
     String payload = new String(event.getPayload());
     System.out.println("收到请求: " + payload);
@@ -57,14 +65,15 @@ import java.util.concurrent.CompletableFuture;
 ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
 options.setRole("slave");
 options.setId("slave-01");
-options.setAuthKey("your-secret-key"); // 必须与 Master 一致
-options.setEncrypted(true);            // 开启加密
+options.setAuthKey("your-secret-key");
+options.setEncrypted(true);
+options.setHeartbeatInterval(3000);
+options.setHeartbeatTimeoutMs(0);
 options.getEndpoints().put("router", "tcp://127.0.0.1:6003");
 
 ZmqClusterNode slave = new ZmqClusterNode(options);
 slave.start().join();
 
-// 发送请求给 Master
 try {
     CompletableFuture<byte[]> future = slave.DEALER("Hello Master!".getBytes(), 5000);
     byte[] reply = future.join();
@@ -78,13 +87,42 @@ try {
 
 ```java
 // 在 Master 广播消息
-master.publish("news", "服务器即将重启".getBytes());
+master.PUBLISH("news", "服务器即将重启".getBytes());
 
 // 在 Slave 订阅消息
-slave.subscribe("news", event -> {
+slave.SUBSCRIBE("news", event -> {
     System.out.println("收到广播: " + new String(event.getPayload()));
 });
+
+// 在 Slave 单向上报消息给 Master
+slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 ```
+
+## 0.6.2 对齐项
+
+- `authKeyMap`：Master 可为不同 Slave 分配不同认证密钥。
+- `heartbeatTimeoutMs`：显式配置心跳确认超时时间。
+- `enablePayloadDigest`：可按需启用或关闭 payload 摘要校验。
+- `isMasterOnline()`：Slave 可读取当前最近一次链路确认状态。
+- `PUSH(topic, payload)`：Slave 可向 Master 发送无回包单向消息。
+- `onPush`：Master 可接收 Slave 的 PUSH 事件。
+- `PUBLISH/SUBSCRIBE/UNSUBSCRIBE`：补充 Node.js 风格大写别名。
+- `auth_failed` 上下文：认证失败事件可读取失败原因与加密状态。
+- `heartbeat_ack` 恢复：心跳确认超时后自动重建 Dealer，避免旧消息在主节点恢复后回灌。
+
+## 恢复语义
+
+- Slave 发出一条 `heartbeat` 后，会等待合法的 `heartbeat_ack` 或合法业务帧确认链路可达。
+- 若在超时时间内未收到合法确认，`isMasterOnline()` 会变为 `false`。
+- 进入恢复流程后，旧 Dealer 会被直接关闭，旧 pending 请求会异常结束，未发送的旧任务会被丢弃。
+- 随后会创建新的 Dealer、重新注册到 Master，并恢复后续心跳。
+- 加密模式下，Slave 在重建后可重新绑定新的 `masterNodeId`，适配主节点重启或主备切换。
+
+## 版本说明
+
+- 当前库版本：`0.6.2`
+- 底层 ZeroMQ Java 绑定：`jeromq 0.6.0`
+- `isMasterOnline()` 表示最近一次链路确认状态，不代表实时网络探测结果。
 
 ## 测试与构建
 
@@ -95,4 +133,4 @@ mvn test
 ```
 
 ## 协议兼容性
-本项目与 Node.js 版本的 [ZNL v0.5.x](https://github.com/Lyrify-Cloud/ZNL) 完全兼容。
+本项目与 Node.js 版本的 [ZNL v0.6.2](https://github.com/Lyrify-Cloud/ZNL) 保持协议兼容，并对齐了 `heartbeat_ack`、`masterOnline`、`push`、断线重建 Dealer、认证失败事件上下文等恢复语义。
