@@ -62,6 +62,8 @@ public class ZmqClusterNode {
 
     private ZmqRequestHandler routerAutoHandler = null;
     private ZmqRequestHandler dealerAutoHandler = null;
+    private ZmqMultipartRequestHandler routerAutoMultipartHandler = null;
+    private ZmqMultipartRequestHandler dealerAutoMultipartHandler = null;
 
     private final List<ZmqEventListener> listeners = new CopyOnWriteArrayList<>();
     private final Map<String, Long> slaves = new ConcurrentHashMap<>();
@@ -72,7 +74,7 @@ public class ZmqClusterNode {
     private Timer heartbeatCheckTimer;
 
     private static class PendingRequest {
-        CompletableFuture<byte[]> future;
+        CompletableFuture<List<byte[]>> future;
         long expireTimeMs;
         long timeoutMs;
         String requestId;
@@ -456,6 +458,14 @@ public class ZmqClusterNode {
         return "slave".equals(options.getRole()) && masterOnline;
     }
 
+    public ZmqClusterNodeOptions getOptions() {
+        return options;
+    }
+
+    public String getRole() {
+        return options.getRole();
+    }
+
     // --- Security Helpers ---
 
     private String createAuthProof(String kind, String requestId, List<byte[]> payloadFrames, byte[] signKeyOverride) {
@@ -478,10 +488,9 @@ public class ZmqClusterNode {
         }
     }
 
-    private List<byte[]> sealPayloadFrames(String kind, String requestId, byte[] payload, byte[] encryptKeyOverride) {
-        List<byte[]> rawFrames = new ArrayList<>();
-        if (payload != null) rawFrames.add(payload);
-        
+    private List<byte[]> sealPayloadFrames(String kind, String requestId, List<byte[]> rawFrames, byte[] encryptKeyOverride) {
+        List<byte[]> safeFrames = rawFrames != null ? new ArrayList<>(rawFrames) : Collections.emptyList();
+
         if (!secureEnabled) return rawFrames;
         byte[] encryptKey = encryptKeyOverride != null ? encryptKeyOverride : (keys != null ? keys.encryptKey : null);
         if (encryptKey == null) throw new RuntimeException("Encryption key not initialized");
@@ -489,7 +498,7 @@ public class ZmqClusterNode {
         try {
             String aadStr = "znl-aad-v1|" + kind + "|" + options.getId() + "|" + (requestId != null ? requestId : "");
             byte[] aad = aadStr.getBytes(StandardCharsets.UTF_8);
-            SecurityUtils.EncryptedResult res = SecurityUtils.encryptFrames(encryptKey, rawFrames, aad);
+            SecurityUtils.EncryptedResult res = SecurityUtils.encryptFrames(encryptKey, safeFrames, aad);
             
             List<byte[]> out = new ArrayList<>();
             out.add(SECURITY_ENVELOPE_VERSION.getBytes(StandardCharsets.UTF_8));
@@ -500,6 +509,10 @@ public class ZmqClusterNode {
         } catch (Exception e) {
             throw new RuntimeException("Failed to encrypt payload", e);
         }
+    }
+
+    private List<byte[]> sealPayloadFrames(String kind, String requestId, byte[] payload, byte[] encryptKeyOverride) {
+        return sealPayloadFrames(kind, requestId, singlePayloadToFrames(payload), encryptKeyOverride);
     }
 
     private List<byte[]> openPayloadFrames(String kind, String requestId, List<byte[]> payloadFrames, String senderNodeId, byte[] encryptKeyOverride) throws Exception {
@@ -892,7 +905,18 @@ public class ZmqClusterNode {
 
         if ("request".equals(parsed.kind)) {
             emitRequest(event);
-            if (routerAutoHandler != null) {
+            if (routerAutoMultipartHandler != null) {
+                try {
+                    routerAutoMultipartHandler.handle(event).thenAccept(replyFrames -> {
+                        replyTo(identity, parsed.requestId, replyFrames);
+                    }).exceptionally(ex -> {
+                        emitError(ex);
+                        return null;
+                    });
+                } catch (Exception e) {
+                    emitError(e);
+                }
+            } else if (routerAutoHandler != null) {
                 try {
                     routerAutoHandler.handle(event).thenAccept(replyPayload -> {
                         replyTo(identity, parsed.requestId, replyPayload);
@@ -908,7 +932,7 @@ public class ZmqClusterNode {
             String key = pendingKey(parsed.requestId, identityText);
             PendingRequest req = pending.remove(key);
             if (req != null) {
-                req.future.complete(payload);
+                req.future.complete(finalFrames);
             }
             emitResponse(event);
         } else if ("push".equals(parsed.kind)) {
@@ -969,7 +993,18 @@ public class ZmqClusterNode {
 
         if ("request".equals(parsed.kind)) {
             emitRequest(event);
-            if (dealerAutoHandler != null) {
+            if (dealerAutoMultipartHandler != null) {
+                try {
+                    dealerAutoMultipartHandler.handle(event).thenAccept(replyFrames -> {
+                        reply(parsed.requestId, replyFrames);
+                    }).exceptionally(ex -> {
+                        emitError(ex);
+                        return null;
+                    });
+                } catch (Exception e) {
+                    emitError(e);
+                }
+            } else if (dealerAutoHandler != null) {
                 try {
                     dealerAutoHandler.handle(event).thenAccept(replyPayload -> {
                         reply(parsed.requestId, replyPayload);
@@ -985,7 +1020,7 @@ public class ZmqClusterNode {
             String key = pendingKey(parsed.requestId, null);
             PendingRequest req = pending.remove(key);
             if (req != null) {
-                req.future.complete(payload);
+                req.future.complete(finalFrames);
             }
             emitResponse(event);
         } else if ("publish".equals(parsed.kind)) {
@@ -1106,9 +1141,17 @@ public class ZmqClusterNode {
         return frames.get(0); 
     }
 
+    private List<byte[]> singlePayloadToFrames(byte[] payload) {
+        List<byte[]> frames = new ArrayList<>();
+        if (payload != null) {
+            frames.add(payload);
+        }
+        return frames;
+    }
+
     // --- Public API ---
 
-    public CompletableFuture<Void> publish(String topic, byte[] payload) {
+    public CompletableFuture<Void> publish(String topic, List<byte[]> payloadFrames) {
         final String finalTopic = topic == null ? DEFAULT_TOPIC : topic;
         byte[] t = finalTopic.getBytes(StandardCharsets.UTF_8);
         
@@ -1132,8 +1175,8 @@ public class ZmqClusterNode {
                         }
                     }
                     
-                    List<byte[]> payloadFrames = sealPayloadFrames("publish", finalTopic, payload, sKeys != null ? sKeys.encryptKey : null);
-                    String proof = secureEnabled ? createAuthProof("publish", finalTopic, payloadFrames, sKeys != null ? sKeys.signKey : null) : "";
+                    List<byte[]> sealedPayloadFrames = sealPayloadFrames("publish", finalTopic, payloadFrames, sKeys != null ? sKeys.encryptKey : null);
+                    String proof = secureEnabled ? createAuthProof("publish", finalTopic, sealedPayloadFrames, sKeys != null ? sKeys.signKey : null) : "";
                     
                     List<byte[]> frames = new ArrayList<>();
                     frames.add(slaveId.getBytes(StandardCharsets.UTF_8));
@@ -1144,7 +1187,7 @@ public class ZmqClusterNode {
                         frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                         frames.add(proof.getBytes(StandardCharsets.UTF_8));
                     }
-                    frames.addAll(payloadFrames);
+                    frames.addAll(sealedPayloadFrames);
                     
                     for (int i = 0; i < frames.size(); i++) {
                         if (i == frames.size() - 1) routerSocket.send(frames.get(i));
@@ -1159,11 +1202,15 @@ public class ZmqClusterNode {
         return f;
     }
 
+    public CompletableFuture<Void> publish(String topic, byte[] payload) {
+        return publish(topic, singlePayloadToFrames(payload));
+    }
+
     public CompletableFuture<Void> PUBLISH(String topic, byte[] payload) {
         return publish(topic, payload);
     }
 
-    public CompletableFuture<Void> PUSH(String topic, byte[] payload) {
+    public CompletableFuture<Void> PUSH(String topic, List<byte[]> payloadFrames) {
         final String finalTopic = topic == null ? DEFAULT_TOPIC : topic;
         byte[] t = finalTopic.getBytes(StandardCharsets.UTF_8);
 
@@ -1172,8 +1219,8 @@ public class ZmqClusterNode {
             try {
                 if (dealerSocket == null) throw new IllegalStateException("DEALER socket not ready");
 
-                List<byte[]> payloadFrames = sealPayloadFrames("push", finalTopic, payload, null);
-                String proof = secureEnabled ? createAuthProof("push", finalTopic, payloadFrames, null) : "";
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("push", finalTopic, payloadFrames, null);
+                String proof = secureEnabled ? createAuthProof("push", finalTopic, sealedPayloadFrames, null) : "";
 
                 List<byte[]> frames = new ArrayList<>();
                 frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
@@ -1183,7 +1230,7 @@ public class ZmqClusterNode {
                     frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                     frames.add(proof.getBytes(StandardCharsets.UTF_8));
                 }
-                frames.addAll(payloadFrames);
+                frames.addAll(sealedPayloadFrames);
 
                 for (int i = 0; i < frames.size(); i++) {
                     if (i == frames.size() - 1) dealerSocket.send(frames.get(i));
@@ -1195,6 +1242,10 @@ public class ZmqClusterNode {
             }
         }, () -> f.completeExceptionally(new Exception("PUSH task discarded before send")));
         return f;
+    }
+
+    public CompletableFuture<Void> PUSH(String topic, byte[] payload) {
+        return PUSH(topic, singlePayloadToFrames(payload));
     }
 
     public CompletableFuture<Void> push(String topic, byte[] payload) {
@@ -1223,10 +1274,16 @@ public class ZmqClusterNode {
 
     public void DEALER(ZmqRequestHandler handler) {
         this.dealerAutoHandler = handler;
+        this.dealerAutoMultipartHandler = null;
     }
 
-    public CompletableFuture<byte[]> DEALER(byte[] payload, int timeoutMs) {
-        CompletableFuture<byte[]> future = new CompletableFuture<>();
+    public void DEALER_MULTIPART(ZmqMultipartRequestHandler handler) {
+        this.dealerAutoMultipartHandler = handler;
+        this.dealerAutoHandler = null;
+    }
+
+    public CompletableFuture<List<byte[]>> DEALER(List<byte[]> payloadFrames, int timeoutMs) {
+        CompletableFuture<List<byte[]>> future = new CompletableFuture<>();
         ensurePendingCapacity();
         String requestId = UUID.randomUUID().toString();
         String key = pendingKey(requestId, null);
@@ -1242,8 +1299,8 @@ public class ZmqClusterNode {
                 pending.put(key, req);
                 req.expireTimeMs = System.currentTimeMillis() + req.timeoutMs;
                 
-                List<byte[]> payloadFrames = sealPayloadFrames("request", requestId, payload, null);
-                String proofOrAuthKey = secureEnabled ? createAuthProof("request", requestId, payloadFrames, null) : "";
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("request", requestId, payloadFrames, null);
+                String proofOrAuthKey = secureEnabled ? createAuthProof("request", requestId, sealedPayloadFrames, null) : "";
                 
                 List<byte[]> frames = new ArrayList<>();
                 frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
@@ -1253,7 +1310,7 @@ public class ZmqClusterNode {
                     frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                     frames.add(proofOrAuthKey.getBytes(StandardCharsets.UTF_8));
                 }
-                frames.addAll(payloadFrames);
+                frames.addAll(sealedPayloadFrames);
 
                 for (int i = 0; i < frames.size(); i++) {
                     if (i == frames.size() - 1) dealerSocket.send(frames.get(i));
@@ -1270,12 +1327,22 @@ public class ZmqClusterNode {
         return future;
     }
 
-    public void ROUTER(ZmqRequestHandler handler) {
-        this.routerAutoHandler = handler;
+    public CompletableFuture<byte[]> DEALER(byte[] payload, int timeoutMs) {
+        return DEALER(singlePayloadToFrames(payload), timeoutMs).thenApply(this::payloadFromFrames);
     }
 
-    public CompletableFuture<byte[]> ROUTER(String identity, byte[] payload, int timeoutMs) {
-        CompletableFuture<byte[]> future = new CompletableFuture<>();
+    public void ROUTER(ZmqRequestHandler handler) {
+        this.routerAutoHandler = handler;
+        this.routerAutoMultipartHandler = null;
+    }
+
+    public void ROUTER_MULTIPART(ZmqMultipartRequestHandler handler) {
+        this.routerAutoMultipartHandler = handler;
+        this.routerAutoHandler = null;
+    }
+
+    public CompletableFuture<List<byte[]>> ROUTER(String identity, List<byte[]> payloadFrames, int timeoutMs) {
+        CompletableFuture<List<byte[]>> future = new CompletableFuture<>();
         ensurePendingCapacity();
         String requestId = UUID.randomUUID().toString();
         String key = pendingKey(requestId, identity);
@@ -1302,8 +1369,8 @@ public class ZmqClusterNode {
                 pending.put(key, req);
                 req.expireTimeMs = System.currentTimeMillis() + req.timeoutMs;
                 
-                List<byte[]> payloadFrames = sealPayloadFrames("request", requestId, payload, sKeys != null ? sKeys.encryptKey : null);
-                String proofOrAuthKey = secureEnabled ? createAuthProof("request", requestId, payloadFrames, sKeys.signKey) : "";
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("request", requestId, payloadFrames, sKeys != null ? sKeys.encryptKey : null);
+                String proofOrAuthKey = secureEnabled ? createAuthProof("request", requestId, sealedPayloadFrames, sKeys.signKey) : "";
                 
                 List<byte[]> frames = new ArrayList<>();
                 frames.add(identity.getBytes(StandardCharsets.UTF_8));
@@ -1314,7 +1381,7 @@ public class ZmqClusterNode {
                     frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                     frames.add(proofOrAuthKey.getBytes(StandardCharsets.UTF_8));
                 }
-                frames.addAll(payloadFrames);
+                frames.addAll(sealedPayloadFrames);
 
                 for (int i = 0; i < frames.size(); i++) {
                     if (i == frames.size() - 1) routerSocket.send(frames.get(i));
@@ -1331,12 +1398,16 @@ public class ZmqClusterNode {
         return future;
     }
 
-    private void reply(String requestId, byte[] payload) {
+    public CompletableFuture<byte[]> ROUTER(String identity, byte[] payload, int timeoutMs) {
+        return ROUTER(identity, singlePayloadToFrames(payload), timeoutMs).thenApply(this::payloadFromFrames);
+    }
+
+    private void reply(String requestId, List<byte[]> payloadFrames) {
         submitTask(() -> {
             if (dealerSocket == null) return;
             try {
-                List<byte[]> payloadFrames = sealPayloadFrames("response", requestId, payload, null);
-                String proof = secureEnabled ? createAuthProof("response", requestId, payloadFrames, null) : "";
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("response", requestId, payloadFrames, null);
+                String proof = secureEnabled ? createAuthProof("response", requestId, sealedPayloadFrames, null) : "";
                 
                 List<byte[]> frames = new ArrayList<>();
                 frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
@@ -1346,7 +1417,7 @@ public class ZmqClusterNode {
                     frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                     frames.add(proof.getBytes(StandardCharsets.UTF_8));
                 }
-                frames.addAll(payloadFrames);
+                frames.addAll(sealedPayloadFrames);
                 
                 for (int i = 0; i < frames.size(); i++) {
                     if (i == frames.size() - 1) dealerSocket.send(frames.get(i));
@@ -1358,7 +1429,11 @@ public class ZmqClusterNode {
         });
     }
 
-    private void replyTo(byte[] identity, String requestId, byte[] payload) {
+    private void reply(String requestId, byte[] payload) {
+        reply(requestId, singlePayloadToFrames(payload));
+    }
+
+    private void replyTo(byte[] identity, String requestId, List<byte[]> payloadFrames) {
         submitTask(() -> {
             if (routerSocket == null) return;
             try {
@@ -1372,8 +1447,8 @@ public class ZmqClusterNode {
                     }
                 }
                 
-                List<byte[]> payloadFrames = sealPayloadFrames("response", requestId, payload, sKeys != null ? sKeys.encryptKey : null);
-                String proof = secureEnabled ? createAuthProof("response", requestId, payloadFrames, sKeys.signKey) : "";
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("response", requestId, payloadFrames, sKeys != null ? sKeys.encryptKey : null);
+                String proof = secureEnabled ? createAuthProof("response", requestId, sealedPayloadFrames, sKeys.signKey) : "";
                 
                 List<byte[]> frames = new ArrayList<>();
                 frames.add(identity);
@@ -1384,7 +1459,7 @@ public class ZmqClusterNode {
                     frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
                     frames.add(proof.getBytes(StandardCharsets.UTF_8));
                 }
-                frames.addAll(payloadFrames);
+                frames.addAll(sealedPayloadFrames);
                 
                 for (int i = 0; i < frames.size(); i++) {
                     if (i == frames.size() - 1) routerSocket.send(frames.get(i));
@@ -1394,6 +1469,10 @@ public class ZmqClusterNode {
                 logger.error("Failed to send replyTo", e);
             }
         });
+    }
+
+    private void replyTo(byte[] identity, String requestId, byte[] payload) {
+        replyTo(identity, requestId, singlePayloadToFrames(payload));
     }
 
     // --- Event Emission ---
