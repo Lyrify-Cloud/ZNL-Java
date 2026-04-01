@@ -10,6 +10,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -272,6 +273,119 @@ public class NodeJsIntegrationTest {
                         } catch (Exception ignored) {
                         }
                     });
+        }
+    }
+
+    @Test
+    public void testNodeMasterFsFullToJavaSlave() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-full-");
+        Files.createDirectories(root.resolve("public"));
+        Files.write(root.resolve("public").resolve("a.txt"), "hello-a".getBytes(StandardCharsets.UTF_8));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-fs-full");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6010");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(
+                false,
+                true,
+                true,
+                true,
+                java.util.Collections.singletonList("public/**"),
+                java.util.Collections.emptyList()
+        ));
+
+        File scriptFile = new File("src/test/resources/test-node-master-fs-full.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js master fs full script not found");
+
+        Process fsProcess = null;
+        try {
+            slave.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+            assertEquals(0, fsProcess.waitFor(20, TimeUnit.SECONDS) ? fsProcess.exitValue() : -1, "Node.js fs full helper did not exit cleanly");
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            slave.stop().join();
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+        }
+    }
+
+    @Test
+    public void testJavaMasterFsToNodeSlave() throws Exception {
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("master");
+        options.setId("java-master-fs");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6011");
+
+        ZmqClusterNode master = new ZmqClusterNode(options);
+        File scriptFile = new File("src/test/resources/test-node-slave-fs-master.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js slave fs master script not found");
+
+        Process fsProcess = null;
+        try {
+            master.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("node-slave-fs-master")) {
+                Thread.sleep(100);
+            }
+            assertTrue(master.getSlaves().contains("node-slave-fs-master"), "Node fs slave did not connect");
+
+            Map<String, Object> st = master.fs().stat("node-slave-fs-master", "public/b.txt");
+            assertEquals(true, st.get("isFile"));
+
+            FsService.ParsedPayload get = master.fs().get("node-slave-fs-master", "public/b.txt");
+            assertEquals("hello-node", new String(get.getBody().get(0), StandardCharsets.UTF_8));
+
+            master.fs().rename("node-slave-fs-master", "public/b.txt", "public/b2.txt");
+
+            String patchText = String.join("\n",
+                    "--- a/public/b2.txt",
+                    "+++ b/public/b2.txt",
+                    "@@ -1 +1 @@",
+                    "-hello-node",
+                    "+hello-node-patched"
+            );
+            Map<String, Object> patch = master.fs().patch("node-slave-fs-master", "public/b2.txt", patchText);
+            assertEquals(true, patch.get("applied"));
+
+            Path upload = Files.createTempFile("znl-java-upload-", ".txt");
+            Path download = Files.createTempFile("znl-java-download-", ".txt");
+            try {
+                Files.write(upload, "upload-java-to-node".getBytes(StandardCharsets.UTF_8));
+                master.fs().upload("node-slave-fs-master", upload.toString(), "public/up.txt");
+                FsService.ParsedPayload uploaded = master.fs().get("node-slave-fs-master", "public/up.txt");
+                assertEquals("upload-java-to-node", new String(uploaded.getBody().get(0), StandardCharsets.UTF_8));
+
+                master.fs().download("node-slave-fs-master", "public/up.txt", download.toString());
+                assertEquals("upload-java-to-node", Files.readString(download, StandardCharsets.UTF_8));
+
+                master.fs().delete("node-slave-fs-master", "public/up.txt");
+            } finally {
+                Files.deleteIfExists(upload);
+                Files.deleteIfExists(download);
+            }
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            master.stop().join();
         }
     }
 

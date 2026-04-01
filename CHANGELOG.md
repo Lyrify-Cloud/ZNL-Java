@@ -11,6 +11,8 @@
 - 新增 Java Slave 侧 `fs` 服务最小实现与 `fs().setRoot(..., policy)` / `getPolicy()` 能力。
 - 对齐 `v0.6.6` `fs` 安全策略关键语义：`readOnly`、`allowedPaths`、`denyGlobs`、路径越权与 `symlink/junction` 拦截。
 - 增加 Node Master -> Java Slave 的 `fs` 策略互通测试，覆盖允许读与拒绝写/越权场景。
+- 补齐完整 `fs` 功能移植：`list/stat/get/delete/rename/patch/upload/download`（含 `init/resume/chunk/ack/complete` 与 `download_init/download_chunk/download_complete` 会话流程）。
+- 新增 Java Master -> Node Slave 与 Node Master -> Java Slave 的完整 `fs` 双向互通测试覆盖。
 
 ## 0.6.2
 
