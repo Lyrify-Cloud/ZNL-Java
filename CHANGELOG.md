@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.6
+
+- 对齐 Node.js ZNL `v0.6.6` 的内部 service 通道协议：新增 `svc_req` / `svc_res` 控制帧解析与收发。
+- 新增 Java 侧 service API：`registerService` / `unregisterService` 与 `SERVICE(identity, service, payload, timeoutMs)`。
+- 新增 `ZmqEvent.service` 字段和 `onServiceRequest` / `onServiceResponse` 事件回调。
+- 对齐 Node.js service 安全语义：对 service 请求/响应使用 `svc:<service>:<requestId>` 参与签名与加密上下文。
+- 对齐默认配置：`enablePayloadDigest` 默认值从 `true` 调整为 `false`。
+- 增加 Node.js 互通测试，覆盖 Java Master -> Node Slave 与 Node Master -> Java Slave 的 service 双向加密调用。
+
 ## 0.6.2
 
 - 对齐 Node.js ZNL 0.6.2 协议与公开 API 语义。

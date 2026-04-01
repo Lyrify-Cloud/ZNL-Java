@@ -24,6 +24,8 @@ public class ZmqClusterNode {
     private static final String CONTROL_PREFIX = "__znl_v1__";
     private static final String CONTROL_REQ = "req";
     private static final String CONTROL_RES = "res";
+    private static final String CONTROL_SVC_REQ = "svc_req";
+    private static final String CONTROL_SVC_RES = "svc_res";
     private static final String CONTROL_AUTH = "__znl_v1_auth__";
     private static final String CONTROL_HEARTBEAT = "heartbeat";
     private static final String CONTROL_HEARTBEAT_ACK = "heartbeat_ack";
@@ -64,6 +66,7 @@ public class ZmqClusterNode {
     private ZmqRequestHandler dealerAutoHandler = null;
     private ZmqMultipartRequestHandler routerAutoMultipartHandler = null;
     private ZmqMultipartRequestHandler dealerAutoMultipartHandler = null;
+    private final Map<String, ZmqMultipartRequestHandler> serviceHandlers = new ConcurrentHashMap<>();
 
     private final List<ZmqEventListener> listeners = new CopyOnWriteArrayList<>();
     private final Map<String, Long> slaves = new ConcurrentHashMap<>();
@@ -869,7 +872,7 @@ public class ZmqClusterNode {
         List<byte[]> finalFrames = parsed.payloadFrames;
         byte[] payload = EMPTY_BUFFER;
         
-        if ("request".equals(parsed.kind) || "response".equals(parsed.kind) || "push".equals(parsed.kind)) {
+        if ("request".equals(parsed.kind) || "response".equals(parsed.kind) || "push".equals(parsed.kind) || "service_request".equals(parsed.kind) || "service_response".equals(parsed.kind)) {
             if (secureEnabled) {
                 SecurityUtils.Keys sKeys = resolveSlaveKeys(identityText);
                 if (sKeys == null) {
@@ -878,8 +881,21 @@ public class ZmqClusterNode {
                     return;
                 }
                 String proof = "request".equals(parsed.kind) ? parsed.authKey : parsed.authProof;
-                String requestKey = "push".equals(parsed.kind) ? parsed.topic : parsed.requestId;
-                VerifyResult v = verifyIncomingProof(parsed.kind, proof, requestKey, parsed.payloadFrames, identityText, sKeys.signKey);
+                String proofKind = "service_response".equals(parsed.kind) ? "response" : parsed.kind;
+                if ("service_request".equals(parsed.kind)) {
+                    proofKind = "request";
+                }
+                String requestKey;
+                if ("push".equals(parsed.kind)) {
+                    requestKey = parsed.topic;
+                } else if ("service_request".equals(parsed.kind)) {
+                    requestKey = "svc:" + parsed.service + ":" + parsed.requestId;
+                } else if ("service_response".equals(parsed.kind)) {
+                    requestKey = "svc:" + parsed.service + ":" + parsed.requestId;
+                } else {
+                    requestKey = parsed.requestId;
+                }
+                VerifyResult v = verifyIncomingProof(proofKind, proof, requestKey, parsed.payloadFrames, identityText, sKeys.signKey);
                 if (!v.ok) {
                     emitAuthFailed(new ZmqEvent("router", frames, parsed.kind, parsed.requestId, proof, parsed.payloadFrames, EMPTY_BUFFER, identity, identityText, parsed.topic), v.error);
                     return;
@@ -888,7 +904,7 @@ public class ZmqClusterNode {
                 
                 if (options.isEncrypted()) {
                     try {
-                        finalFrames = openPayloadFrames(parsed.kind, requestKey, parsed.payloadFrames, identityText, sKeys.encryptKey);
+                        finalFrames = openPayloadFrames(proofKind, requestKey, parsed.payloadFrames, identityText, sKeys.encryptKey);
                     } catch (Exception e) {
                         emitAuthFailed(new ZmqEvent("router", frames, parsed.kind, parsed.requestId, proof, parsed.payloadFrames, EMPTY_BUFFER, identity, identityText, parsed.topic), "Payload decrypt failed: " + e.getMessage());
                         return;
@@ -900,7 +916,7 @@ public class ZmqClusterNode {
         }
         
         payload = payloadFromFrames(finalFrames);
-        ZmqEvent event = new ZmqEvent("router", frames, parsed.kind, parsed.requestId, parsed.authKey, finalFrames, payload, identity, identityText, parsed.topic);
+        ZmqEvent event = new ZmqEvent("router", frames, parsed.kind, parsed.requestId, parsed.authKey, finalFrames, payload, identity, identityText, parsed.topic, parsed.service, null, false);
         event = emitMessage(event);
 
         if ("request".equals(parsed.kind)) {
@@ -937,6 +953,30 @@ public class ZmqClusterNode {
             emitResponse(event);
         } else if ("push".equals(parsed.kind)) {
             emitPush(event);
+        } else if ("service_request".equals(parsed.kind)) {
+            emitServiceRequest(event);
+            ZmqMultipartRequestHandler handler = serviceHandlers.get(parsed.service);
+            if (handler != null) {
+                try {
+                    handler.handle(event).thenAccept(replyFrames -> {
+                        replyServiceTo(identity, parsed.requestId, parsed.service, replyFrames);
+                    }).exceptionally(ex -> {
+                        emitError(ex);
+                        replyServiceTo(identity, parsed.requestId, parsed.service, buildServiceErrorPayload(ex));
+                        return null;
+                    });
+                } catch (Exception e) {
+                    emitError(e);
+                    replyServiceTo(identity, parsed.requestId, parsed.service, buildServiceErrorPayload(e));
+                }
+            }
+        } else if ("service_response".equals(parsed.kind)) {
+            String key = pendingKey("svc:" + parsed.service + ":" + parsed.requestId, identityText);
+            PendingRequest req = pending.remove(key);
+            if (req != null) {
+                req.future.complete(finalFrames);
+            }
+            emitServiceResponse(event);
         }
     }
 
@@ -962,11 +1002,22 @@ public class ZmqClusterNode {
             return;
         }
         
-        if ("publish".equals(parsed.kind) || "request".equals(parsed.kind) || "response".equals(parsed.kind)) {
+        if ("publish".equals(parsed.kind) || "request".equals(parsed.kind) || "response".equals(parsed.kind) || "service_request".equals(parsed.kind)) {
             if (secureEnabled) {
                 String proof = "request".equals(parsed.kind) ? parsed.authKey : parsed.authProof;
-                String reqId = "publish".equals(parsed.kind) ? parsed.topic : parsed.requestId;
-                VerifyResult v = verifyIncomingProof("publish".equals(parsed.kind) ? "publish" : parsed.kind, proof, reqId, parsed.payloadFrames, masterNodeId, null);
+                String reqId;
+                String verifyKind;
+                if ("publish".equals(parsed.kind)) {
+                    reqId = parsed.topic;
+                    verifyKind = "publish";
+                } else if ("service_request".equals(parsed.kind)) {
+                    reqId = "svc:" + parsed.service + ":" + parsed.requestId;
+                    verifyKind = "request";
+                } else {
+                    reqId = parsed.requestId;
+                    verifyKind = parsed.kind;
+                }
+                VerifyResult v = verifyIncomingProof(verifyKind, proof, reqId, parsed.payloadFrames, masterNodeId, null);
                 if (!v.ok) {
                     emitAuthFailed(new ZmqEvent("dealer", frames, parsed.kind, parsed.requestId, proof, parsed.payloadFrames, EMPTY_BUFFER, null, null, parsed.topic), v.error);
                     return;
@@ -977,7 +1028,7 @@ public class ZmqClusterNode {
                 if (options.isEncrypted()) {
                     try {
                         String expectedNodeId = "publish".equals(parsed.kind) ? v.envelope.nodeId : masterNodeId;
-                        finalFrames = openPayloadFrames("publish".equals(parsed.kind) ? "publish" : parsed.kind, reqId, parsed.payloadFrames, expectedNodeId, null);
+                        finalFrames = openPayloadFrames(verifyKind, reqId, parsed.payloadFrames, expectedNodeId, null);
                     } catch (Exception e) {
                         emitAuthFailed(new ZmqEvent("dealer", frames, parsed.kind, parsed.requestId, proof, parsed.payloadFrames, EMPTY_BUFFER, null, null, parsed.topic), "decryption failed: " + e.getMessage());
                         return;
@@ -988,7 +1039,7 @@ public class ZmqClusterNode {
         }
 
         payload = payloadFromFrames(finalFrames);
-        ZmqEvent event = new ZmqEvent("dealer", frames, parsed.kind, parsed.requestId, parsed.authKey, finalFrames, payload, null, null, parsed.topic);
+        ZmqEvent event = new ZmqEvent("dealer", frames, parsed.kind, parsed.requestId, parsed.authKey, finalFrames, payload, null, null, parsed.topic, parsed.service, null, false);
         event = emitMessage(event);
 
         if ("request".equals(parsed.kind)) {
@@ -1029,6 +1080,23 @@ public class ZmqClusterNode {
             if (sub != null) {
                 try { sub.accept(event); } catch (Exception e) { emitError(e); }
             }
+        } else if ("service_request".equals(parsed.kind)) {
+            emitServiceRequest(event);
+            ZmqMultipartRequestHandler handler = serviceHandlers.get(parsed.service);
+            if (handler != null) {
+                try {
+                    handler.handle(event).thenAccept(replyFrames -> {
+                        replyService(parsed.requestId, parsed.service, replyFrames);
+                    }).exceptionally(ex -> {
+                        emitError(ex);
+                        replyService(parsed.requestId, parsed.service, buildServiceErrorPayload(ex));
+                        return null;
+                    });
+                } catch (Exception e) {
+                    emitError(e);
+                    replyService(parsed.requestId, parsed.service, buildServiceErrorPayload(e));
+                }
+            }
         }
     }
 
@@ -1038,6 +1106,7 @@ public class ZmqClusterNode {
         String authKey = null;
         String authProof = null;
         String topic = null;
+        String service = null;
         List<byte[]> payloadFrames = new ArrayList<>();
     }
 
@@ -1108,6 +1177,23 @@ public class ZmqClusterNode {
                     }
                     return parsed;
                 }
+
+                if ((CONTROL_SVC_REQ.equals(action) || CONTROL_SVC_RES.equals(action)) && frames.size() >= 4) {
+                    String requestId = new String(frames.get(2), StandardCharsets.UTF_8);
+                    String service = new String(frames.get(3), StandardCharsets.UTF_8);
+                    if (!requestId.isEmpty() && !service.isEmpty()) {
+                        int payloadStart = 4;
+                        if (frames.size() >= 6 && CONTROL_AUTH.equals(new String(frames.get(4), StandardCharsets.UTF_8))) {
+                            parsed.authProof = new String(frames.get(5), StandardCharsets.UTF_8);
+                            payloadStart = 6;
+                        }
+                        parsed.kind = CONTROL_SVC_REQ.equals(action) ? "service_request" : "service_response";
+                        parsed.requestId = requestId;
+                        parsed.service = service;
+                        parsed.payloadFrames = frames.size() > payloadStart ? frames.subList(payloadStart, frames.size()) : Collections.emptyList();
+                        return parsed;
+                    }
+                }
                 
                 if (frames.size() >= 3) {
                     String requestId = new String(frames.get(2), StandardCharsets.UTF_8);
@@ -1151,7 +1237,29 @@ public class ZmqClusterNode {
 
     // --- Public API ---
 
+    public ZmqClusterNode registerService(String service, ZmqMultipartRequestHandler handler) {
+        if (service == null || service.isEmpty()) {
+            throw new IllegalArgumentException("service cannot be empty");
+        }
+        if (handler == null) {
+            throw new IllegalArgumentException("service handler cannot be null");
+        }
+        serviceHandlers.put(service, handler);
+        return this;
+    }
+
+    public ZmqClusterNode unregisterService(String service) {
+        if (service == null || service.isEmpty()) {
+            throw new IllegalArgumentException("service cannot be empty");
+        }
+        serviceHandlers.remove(service);
+        return this;
+    }
+
     public CompletableFuture<Void> publish(String topic, List<byte[]> payloadFrames) {
+        if (!"master".equals(options.getRole())) {
+            throw new IllegalStateException("publish() can only be called on master");
+        }
         final String finalTopic = topic == null ? DEFAULT_TOPIC : topic;
         byte[] t = finalTopic.getBytes(StandardCharsets.UTF_8);
         
@@ -1211,6 +1319,9 @@ public class ZmqClusterNode {
     }
 
     public CompletableFuture<Void> PUSH(String topic, List<byte[]> payloadFrames) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("PUSH() can only be called on slave");
+        }
         final String finalTopic = topic == null ? DEFAULT_TOPIC : topic;
         byte[] t = finalTopic.getBytes(StandardCharsets.UTF_8);
 
@@ -1253,6 +1364,9 @@ public class ZmqClusterNode {
     }
 
     public void subscribe(String topic, java.util.function.Consumer<ZmqEvent> handler) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("subscribe() can only be called on slave");
+        }
         subscriptions.put(topic, handler);
     }
 
@@ -1261,6 +1375,9 @@ public class ZmqClusterNode {
     }
 
     public void unsubscribe(String topic) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("unsubscribe() can only be called on slave");
+        }
         subscriptions.remove(topic);
     }
 
@@ -1273,16 +1390,25 @@ public class ZmqClusterNode {
     }
 
     public void DEALER(ZmqRequestHandler handler) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("DEALER(handler) can only be called on slave");
+        }
         this.dealerAutoHandler = handler;
         this.dealerAutoMultipartHandler = null;
     }
 
     public void DEALER_MULTIPART(ZmqMultipartRequestHandler handler) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("DEALER_MULTIPART(handler) can only be called on slave");
+        }
         this.dealerAutoMultipartHandler = handler;
         this.dealerAutoHandler = null;
     }
 
     public CompletableFuture<List<byte[]>> DEALER(List<byte[]> payloadFrames, int timeoutMs) {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("DEALER(request) can only be called on slave");
+        }
         CompletableFuture<List<byte[]>> future = new CompletableFuture<>();
         ensurePendingCapacity();
         String requestId = UUID.randomUUID().toString();
@@ -1332,16 +1458,25 @@ public class ZmqClusterNode {
     }
 
     public void ROUTER(ZmqRequestHandler handler) {
+        if (!"master".equals(options.getRole())) {
+            throw new IllegalStateException("ROUTER(handler) can only be called on master");
+        }
         this.routerAutoHandler = handler;
         this.routerAutoMultipartHandler = null;
     }
 
     public void ROUTER_MULTIPART(ZmqMultipartRequestHandler handler) {
+        if (!"master".equals(options.getRole())) {
+            throw new IllegalStateException("ROUTER_MULTIPART(handler) can only be called on master");
+        }
         this.routerAutoMultipartHandler = handler;
         this.routerAutoHandler = null;
     }
 
     public CompletableFuture<List<byte[]>> ROUTER(String identity, List<byte[]> payloadFrames, int timeoutMs) {
+        if (!"master".equals(options.getRole())) {
+            throw new IllegalStateException("ROUTER(request) can only be called on master");
+        }
         CompletableFuture<List<byte[]>> future = new CompletableFuture<>();
         ensurePendingCapacity();
         String requestId = UUID.randomUUID().toString();
@@ -1400,6 +1535,79 @@ public class ZmqClusterNode {
 
     public CompletableFuture<byte[]> ROUTER(String identity, byte[] payload, int timeoutMs) {
         return ROUTER(identity, singlePayloadToFrames(payload), timeoutMs).thenApply(this::payloadFromFrames);
+    }
+
+    public CompletableFuture<List<byte[]>> SERVICE(String identity, String service, List<byte[]> payloadFrames, int timeoutMs) {
+        if (!"master".equals(options.getRole())) {
+            throw new IllegalStateException("SERVICE(request) can only be called on master");
+        }
+        if (identity == null || identity.isEmpty()) {
+            throw new IllegalArgumentException("identity cannot be empty");
+        }
+        if (service == null || service.isEmpty()) {
+            throw new IllegalArgumentException("service cannot be empty");
+        }
+
+        CompletableFuture<List<byte[]>> future = new CompletableFuture<>();
+        ensurePendingCapacity();
+        String requestId = UUID.randomUUID().toString();
+        String securityRequestId = "svc:" + service + ":" + requestId;
+        String key = pendingKey(securityRequestId, identity);
+
+        PendingRequest req = new PendingRequest();
+        req.future = future;
+        req.requestId = securityRequestId;
+        req.identityText = identity;
+        req.timeoutMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
+
+        submitTask(() -> {
+            try {
+                if (routerSocket == null) throw new IllegalStateException("ROUTER socket not ready");
+
+                SecurityUtils.Keys sKeys = null;
+                if (secureEnabled) {
+                    sKeys = resolveSlaveKeys(identity);
+                    if (sKeys == null) {
+                        future.completeExceptionally(new Exception("No authKey configured for slave: " + identity));
+                        return;
+                    }
+                }
+
+                pending.put(key, req);
+                req.expireTimeMs = System.currentTimeMillis() + req.timeoutMs;
+
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("request", securityRequestId, payloadFrames, sKeys != null ? sKeys.encryptKey : null);
+                String proof = secureEnabled ? createAuthProof("request", securityRequestId, sealedPayloadFrames, sKeys.signKey) : "";
+
+                List<byte[]> frames = new ArrayList<>();
+                frames.add(identity.getBytes(StandardCharsets.UTF_8));
+                frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
+                frames.add(CONTROL_SVC_REQ.getBytes(StandardCharsets.UTF_8));
+                frames.add(requestId.getBytes(StandardCharsets.UTF_8));
+                frames.add(service.getBytes(StandardCharsets.UTF_8));
+                if (proof != null && !proof.isEmpty()) {
+                    frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
+                    frames.add(proof.getBytes(StandardCharsets.UTF_8));
+                }
+                frames.addAll(sealedPayloadFrames);
+
+                for (int i = 0; i < frames.size(); i++) {
+                    if (i == frames.size() - 1) routerSocket.send(frames.get(i));
+                    else routerSocket.sendMore(frames.get(i));
+                }
+            } catch (Exception e) {
+                pending.remove(key);
+                future.completeExceptionally(e);
+            }
+        }, () -> {
+            pending.remove(key);
+            future.completeExceptionally(new Exception("SERVICE request discarded before send"));
+        });
+        return future;
+    }
+
+    public CompletableFuture<byte[]> SERVICE(String identity, String service, byte[] payload, int timeoutMs) {
+        return SERVICE(identity, service, singlePayloadToFrames(payload), timeoutMs).thenApply(this::payloadFromFrames);
     }
 
     private void reply(String requestId, List<byte[]> payloadFrames) {
@@ -1475,6 +1683,82 @@ public class ZmqClusterNode {
         replyTo(identity, requestId, singlePayloadToFrames(payload));
     }
 
+    private void replyService(String requestId, String service, List<byte[]> payloadFrames) {
+        submitTask(() -> {
+            if (dealerSocket == null) return;
+            try {
+                String securityRequestId = "svc:" + service + ":" + requestId;
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("response", securityRequestId, payloadFrames, null);
+                String proof = secureEnabled ? createAuthProof("response", securityRequestId, sealedPayloadFrames, null) : "";
+
+                List<byte[]> frames = new ArrayList<>();
+                frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
+                frames.add(CONTROL_SVC_RES.getBytes(StandardCharsets.UTF_8));
+                frames.add(requestId.getBytes(StandardCharsets.UTF_8));
+                frames.add(service.getBytes(StandardCharsets.UTF_8));
+                if (proof != null && !proof.isEmpty()) {
+                    frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
+                    frames.add(proof.getBytes(StandardCharsets.UTF_8));
+                }
+                frames.addAll(sealedPayloadFrames);
+
+                for (int i = 0; i < frames.size(); i++) {
+                    if (i == frames.size() - 1) dealerSocket.send(frames.get(i));
+                    else dealerSocket.sendMore(frames.get(i));
+                }
+            } catch (Exception e) {
+                logger.error("Failed to send service reply", e);
+            }
+        });
+    }
+
+    private void replyServiceTo(byte[] identity, String requestId, String service, List<byte[]> payloadFrames) {
+        submitTask(() -> {
+            if (routerSocket == null) return;
+            try {
+                String identityText = new String(identity, StandardCharsets.UTF_8);
+                SecurityUtils.Keys sKeys = null;
+                if (secureEnabled) {
+                    sKeys = resolveSlaveKeys(identityText);
+                    if (sKeys == null) {
+                        logger.error("Failed to send service replyTo: No authKey configured for slave {}", identityText);
+                        return;
+                    }
+                }
+
+                String securityRequestId = "svc:" + service + ":" + requestId;
+                List<byte[]> sealedPayloadFrames = sealPayloadFrames("response", securityRequestId, payloadFrames, sKeys != null ? sKeys.encryptKey : null);
+                String proof = secureEnabled ? createAuthProof("response", securityRequestId, sealedPayloadFrames, sKeys.signKey) : "";
+
+                List<byte[]> frames = new ArrayList<>();
+                frames.add(identity);
+                frames.add(CONTROL_PREFIX.getBytes(StandardCharsets.UTF_8));
+                frames.add(CONTROL_SVC_RES.getBytes(StandardCharsets.UTF_8));
+                frames.add(requestId.getBytes(StandardCharsets.UTF_8));
+                frames.add(service.getBytes(StandardCharsets.UTF_8));
+                if (proof != null && !proof.isEmpty()) {
+                    frames.add(CONTROL_AUTH.getBytes(StandardCharsets.UTF_8));
+                    frames.add(proof.getBytes(StandardCharsets.UTF_8));
+                }
+                frames.addAll(sealedPayloadFrames);
+
+                for (int i = 0; i < frames.size(); i++) {
+                    if (i == frames.size() - 1) routerSocket.send(frames.get(i));
+                    else routerSocket.sendMore(frames.get(i));
+                }
+            } catch (Exception e) {
+                logger.error("Failed to send service replyTo", e);
+            }
+        });
+    }
+
+    private List<byte[]> buildServiceErrorPayload(Throwable error) {
+        String msg = error != null && error.getMessage() != null ? error.getMessage() : String.valueOf(error);
+        String escaped = msg.replace("\\", "\\\\").replace("\"", "\\\"");
+        String json = "{\"ok\":false,\"error\":\"" + escaped + "\"}";
+        return Collections.singletonList(json.getBytes(StandardCharsets.UTF_8));
+    }
+
     // --- Event Emission ---
 
     private ZmqEvent emitMessage(ZmqEvent event) {
@@ -1505,6 +1789,18 @@ public class ZmqClusterNode {
     private void emitPush(ZmqEvent event) {
         for (ZmqEventListener listener : listeners) {
             try { listener.onPush(event); } catch (Exception e) { emitError(e); }
+        }
+    }
+
+    private void emitServiceRequest(ZmqEvent event) {
+        for (ZmqEventListener listener : listeners) {
+            try { listener.onServiceRequest(event); } catch (Exception e) { emitError(e); }
+        }
+    }
+
+    private void emitServiceResponse(ZmqEvent event) {
+        for (ZmqEventListener listener : listeners) {
+            try { listener.onServiceResponse(event); } catch (Exception e) { emitError(e); }
         }
     }
 

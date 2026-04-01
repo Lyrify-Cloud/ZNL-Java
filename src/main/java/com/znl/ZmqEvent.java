@@ -13,18 +13,25 @@ public class ZmqEvent {
     private final byte[] identity;
     private final String identityText;
     private final String topic;
+    private final String service;
     private final String authReason;
     private final boolean encrypted;
 
     public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
                     String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
                     String identityText, String topic) {
-        this(channel, frames, kind, requestId, authKey, payloadFrames, payload, identity, identityText, topic, null, false);
+        this(channel, frames, kind, requestId, authKey, payloadFrames, payload, identity, identityText, topic, null, null, false);
     }
 
     public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
                     String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
-                    String identityText, String topic, String authReason, boolean encrypted) {
+                    String identityText, String topic, String service) {
+        this(channel, frames, kind, requestId, authKey, payloadFrames, payload, identity, identityText, topic, service, null, false);
+    }
+
+    public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
+                    String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
+                    String identityText, String topic, String service, String authReason, boolean encrypted) {
         this.channel = channel;
         this.frames = frames;
         this.kind = kind;
@@ -35,8 +42,15 @@ public class ZmqEvent {
         this.identity = identity;
         this.identityText = identityText;
         this.topic = topic;
+        this.service = service;
         this.authReason = authReason;
         this.encrypted = encrypted;
+    }
+
+    public ZmqEvent(String channel, List<byte[]> frames, String kind, String requestId,
+                    String authKey, List<byte[]> payloadFrames, byte[] payload, byte[] identity,
+                    String identityText, String topic, String authReason, boolean encrypted) {
+        this(channel, frames, kind, requestId, authKey, payloadFrames, payload, identity, identityText, topic, null, authReason, encrypted);
     }
 
     public String getChannel() { return channel; }
@@ -49,6 +63,7 @@ public class ZmqEvent {
     public byte[] getIdentity() { return identity; }
     public String getIdentityText() { return identityText; }
     public String getTopic() { return topic; }
+    public String getService() { return service; }
     public String getAuthReason() { return authReason; }
     public boolean isEncrypted() { return encrypted; }
 }

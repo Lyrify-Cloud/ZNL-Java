@@ -1,6 +1,6 @@
 # ZNL Java
 
-ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC、Pub/Sub 与 PUSH 通信库，当前与 Node.js [ZNL v0.6.2](https://github.com/Lyrify-Cloud/ZNL) 的协议与恢复语义保持对齐。
+ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC、Pub/Sub、PUSH 与 Service 通信库，当前与 Node.js [ZNL v0.6.6](https://github.com/Lyrify-Cloud/ZNL) 的核心协议语义保持对齐。
 
 ## 特性
 
@@ -11,6 +11,8 @@ ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ
 - 📡 **双端支持**：可作为 Master (ROUTER) 或 Slave (DEALER) 运行。
 - 🔄 **异步 API**：基于 `CompletableFuture`，非阻塞设计。
 - 📬 **单向 PUSH**：Slave 支持 `PUSH(topic, payload)` 向 Master 无回包上报。
+- 🧩 **独立 Service 通道**：支持 `svc_req/svc_res` 内部服务请求响应，不与业务 RPC 串流。
+- 🔧 **Service API**：支持 `registerService/unregisterService` 以及 Master 侧 `SERVICE(...)` 调用。
 - 💓 **心跳确认链路**：Slave 使用 `heartbeat -> heartbeat_ack` 维护链路状态。
 - ♻️ **断线自动恢复**：`heartbeat_ack` 超时后会重建 Dealer、取消旧 pending 并重新注册。
 - 📶 **在线状态可观测**：Slave 提供 `isMasterOnline()` 用于读取最近一次链路确认状态。
@@ -98,6 +100,15 @@ slave.SUBSCRIBE("news", event -> {
 slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 ```
 
+## 0.6.6 对齐项
+
+- `svc_req/svc_res`：新增内部 service 控制帧与事件语义。
+- `registerService/unregisterService`：支持在节点侧注册/注销 service 处理器。
+- `SERVICE(identity, service, payload, timeoutMs)`：Master 可通过 service 通道请求指定 Slave。
+- `onServiceRequest/onServiceResponse`：新增 service 事件回调。
+- `ZmqEvent.service`：事件携带 service 名称。
+- `enablePayloadDigest` 默认值更新为 `false`，与 Node.js 最新默认行为一致。
+
 ## 0.6.2 对齐项
 
 - `authKeyMap`：Master 可为不同 Slave 分配不同认证密钥。
@@ -120,7 +131,7 @@ slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 
 ## 版本说明
 
-- 当前库版本：`0.6.2`
+- 当前库版本：`0.6.6`
 - 底层 ZeroMQ Java 绑定：`jeromq 0.6.0`
 - `isMasterOnline()` 表示最近一次链路确认状态，不代表实时网络探测结果。
 
@@ -133,4 +144,4 @@ mvn test
 ```
 
 ## 协议兼容性
-本项目与 Node.js 版本的 [ZNL v0.6.2](https://github.com/Lyrify-Cloud/ZNL) 保持协议兼容，并对齐了 `heartbeat_ack`、`masterOnline`、`push`、断线重建 Dealer、认证失败事件上下文等恢复语义。
+本项目与 Node.js 版本的 [ZNL v0.6.6](https://github.com/Lyrify-Cloud/ZNL) 保持核心协议兼容，并对齐了 `heartbeat_ack`、`masterOnline`、`push`、`svc_req/svc_res`、断线重建 Dealer、认证失败事件上下文等语义。

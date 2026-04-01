@@ -15,7 +15,7 @@ public class ZmqClusterNodeOptions {
     private int heartbeatInterval = 3000;
     private int heartbeatTimeoutMs = 0;
     private boolean encrypted = false;
-    private boolean enablePayloadDigest = true;
+    private boolean enablePayloadDigest = false;
     private long maxTimeSkewMs = SecurityUtils.MAX_TIME_SKEW_MS;
     private long replayWindowMs = SecurityUtils.REPLAY_WINDOW_MS;
 

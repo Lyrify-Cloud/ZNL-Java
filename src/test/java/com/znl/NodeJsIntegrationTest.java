@@ -153,6 +153,77 @@ public class NodeJsIntegrationTest {
         }
     }
 
+    @Test
+    public void testJavaMasterServiceToNodeSlave() throws Exception {
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("master");
+        options.setId("java-master-svc");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6008");
+
+        ZmqClusterNode master = new ZmqClusterNode(options);
+        File scriptFile = new File("src/test/resources/test-node-slave-service.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js slave service script not found");
+
+        Process svcProcess = null;
+        try {
+            master.start().join();
+            svcProcess = startNodeProcess(scriptFile);
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("node-slave-service")) {
+                Thread.sleep(100);
+            }
+            assertTrue(master.getSlaves().contains("node-slave-service"), "Node.js slave service did not connect to Java master");
+
+            byte[] reply = master.SERVICE(
+                    "node-slave-service",
+                    "echo",
+                    "hello-service".getBytes(StandardCharsets.UTF_8),
+                    3000
+            ).get(5, TimeUnit.SECONDS);
+            assertEquals("node-echo:hello-service", new String(reply, StandardCharsets.UTF_8));
+        } finally {
+            if (svcProcess != null && svcProcess.isAlive()) {
+                svcProcess.destroyForcibly();
+            }
+            master.stop().join();
+        }
+    }
+
+    @Test
+    public void testNodeMasterServiceToJavaSlave() throws Exception {
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-service");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6007");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.registerService("echo", event -> CompletableFuture.completedFuture(
+                java.util.Collections.singletonList(
+                        ("java-echo:" + new String(event.getPayload(), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)
+                )
+        ));
+
+        File scriptFile = new File("src/test/resources/test-node-master-service.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js master service script not found");
+
+        Process svcProcess = null;
+        try {
+            slave.start().join();
+            svcProcess = startNodeProcess(scriptFile);
+            assertEquals(0, svcProcess.waitFor(12, TimeUnit.SECONDS) ? svcProcess.exitValue() : -1, "Node.js service helper did not exit cleanly");
+        } finally {
+            if (svcProcess != null && svcProcess.isAlive()) {
+                svcProcess.destroyForcibly();
+            }
+            slave.stop().join();
+        }
+    }
+
     private static Process startNodeProcess(File scriptFile) throws Exception {
         ProcessBuilder pb = new ProcessBuilder("node", scriptFile.getAbsolutePath());
         pb.redirectErrorStream(true);
