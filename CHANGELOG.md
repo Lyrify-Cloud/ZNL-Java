@@ -8,6 +8,9 @@
 - 对齐 Node.js service 安全语义：对 service 请求/响应使用 `svc:<service>:<requestId>` 参与签名与加密上下文。
 - 对齐默认配置：`enablePayloadDigest` 默认值从 `true` 调整为 `false`。
 - 增加 Node.js 互通测试，覆盖 Java Master -> Node Slave 与 Node Master -> Java Slave 的 service 双向加密调用。
+- 新增 Java Slave 侧 `fs` 服务最小实现与 `fs().setRoot(..., policy)` / `getPolicy()` 能力。
+- 对齐 `v0.6.6` `fs` 安全策略关键语义：`readOnly`、`allowedPaths`、`denyGlobs`、路径越权与 `symlink/junction` 拦截。
+- 增加 Node Master -> Java Slave 的 `fs` 策略互通测试，覆盖允许读与拒绝写/越权场景。
 
 ## 0.6.2
 

@@ -13,6 +13,7 @@ ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ
 - 📬 **单向 PUSH**：Slave 支持 `PUSH(topic, payload)` 向 Master 无回包上报。
 - 🧩 **独立 Service 通道**：支持 `svc_req/svc_res` 内部服务请求响应，不与业务 RPC 串流。
 - 🔧 **Service API**：支持 `registerService/unregisterService` 以及 Master 侧 `SERVICE(...)` 调用。
+- 📁 **FS Slave 服务**：支持 `slave.fs().setRoot(root, policy)` 与 `getPolicy()`，可与 Node `master.fs` 互通。
 - 💓 **心跳确认链路**：Slave 使用 `heartbeat -> heartbeat_ack` 维护链路状态。
 - ♻️ **断线自动恢复**：`heartbeat_ack` 超时后会重建 Dealer、取消旧 pending 并重新注册。
 - 📶 **在线状态可观测**：Slave 提供 `isMasterOnline()` 用于读取最近一次链路确认状态。
@@ -108,6 +109,8 @@ slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 - `onServiceRequest/onServiceResponse`：新增 service 事件回调。
 - `ZmqEvent.service`：事件携带 service 名称。
 - `enablePayloadDigest` 默认值更新为 `false`，与 Node.js 最新默认行为一致。
+- `slave.fs().setRoot(root, policy)` / `getPolicy()`：支持 `readOnly`、`allowedPaths`、`denyGlobs` 等策略。
+- `fs` 路径安全：拦截 root 越权访问与路径链路中的 `symlink/junction`。
 
 ## 0.6.2 对齐项
 

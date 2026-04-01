@@ -71,6 +71,7 @@ public class ZmqClusterNode {
     private final List<ZmqEventListener> listeners = new CopyOnWriteArrayList<>();
     private final Map<String, Long> slaves = new ConcurrentHashMap<>();
     private final Map<String, java.util.function.Consumer<ZmqEvent>> subscriptions = new ConcurrentHashMap<>();
+    private FsSlaveService fsSlaveService;
     
     private Timer heartbeatTimer;
     private Timer heartbeatAckTimer;
@@ -467,6 +468,16 @@ public class ZmqClusterNode {
 
     public String getRole() {
         return options.getRole();
+    }
+
+    public synchronized FsSlaveService fs() {
+        if (!"slave".equals(options.getRole())) {
+            throw new IllegalStateException("fs() is only available on slave");
+        }
+        if (fsSlaveService == null) {
+            fsSlaveService = new FsSlaveService(this);
+        }
+        return fsSlaveService;
     }
 
     // --- Security Helpers ---

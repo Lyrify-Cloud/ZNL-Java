@@ -8,6 +8,8 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -221,6 +223,55 @@ public class NodeJsIntegrationTest {
                 svcProcess.destroyForcibly();
             }
             slave.stop().join();
+        }
+    }
+
+    @Test
+    public void testNodeMasterFsPolicyToJavaSlave() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-");
+        Files.createDirectories(root.resolve("public"));
+        Files.createDirectories(root.resolve("secret"));
+        Files.write(root.resolve("public").resolve("a.txt"), "hello-public".getBytes(StandardCharsets.UTF_8));
+        Files.write(root.resolve("secret").resolve("hidden.txt"), "secret-data".getBytes(StandardCharsets.UTF_8));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-fs");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6009");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(
+                true,
+                true,
+                true,
+                true,
+                java.util.Collections.singletonList("public/**"),
+                java.util.Collections.singletonList("secret/**")
+        ));
+
+        File scriptFile = new File("src/test/resources/test-node-master-fs-policy.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js master fs policy script not found");
+
+        Process fsProcess = null;
+        try {
+            slave.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+            assertEquals(0, fsProcess.waitFor(12, TimeUnit.SECONDS) ? fsProcess.exitValue() : -1, "Node.js fs policy helper did not exit cleanly");
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            slave.stop().join();
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
         }
     }
 
