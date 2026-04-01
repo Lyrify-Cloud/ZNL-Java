@@ -58,6 +58,7 @@ public class FsService {
     private volatile Path rootDir;
     private volatile FsPolicy policy = FsPolicy.defaults();
     private volatile boolean serviceRegistered = false;
+    private volatile long rootGeneration = 0L;
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
@@ -184,10 +185,19 @@ public class FsService {
         String sessionId = sessionIdInput != null && !sessionIdInput.isEmpty() ? sessionIdInput : createSessionId();
 
         Path absolutePath = Paths.get(str(localPath)).toAbsolutePath().normalize();
+        if (Files.exists(absolutePath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes attrs = lstat(absolutePath);
+            if (attrs.isDirectory() || attrs.isSymbolicLink() || isWindowsReparsePoint(absolutePath) || !attrs.isRegularFile()) {
+                throw new IllegalArgumentException("download destination must be a regular file path");
+            }
+        }
         Files.createDirectories(absolutePath.getParent());
-        Path tmpPath = Paths.get(absolutePath.toString() + ".tmp");
+        Path tmpPath = Files.createTempFile(absolutePath.getParent(), absolutePath.getFileName().toString() + ".download-", ".tmp");
+        if (lstat(tmpPath).isSymbolicLink() || isWindowsReparsePoint(tmpPath)) {
+            throw new IllegalArgumentException("refuse download temp link");
+        }
 
-        long offset = Files.exists(tmpPath) && Files.isRegularFile(tmpPath) ? Files.size(tmpPath) : 0L;
+        long offset = Files.size(tmpPath);
 
         ParsedPayload initResp = request(
                 slaveId,
@@ -200,10 +210,6 @@ public class FsService {
         offset = toLong(initResp.meta.get("offset"), offset);
         int totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
         int chunkId = (int) (offset / chunkSize);
-
-        if (!Files.exists(tmpPath)) {
-            Files.createFile(tmpPath);
-        }
 
         while (offset < fileSize) {
             ParsedPayload resp = request(
@@ -224,7 +230,7 @@ public class FsService {
             chunkId += 1;
         }
 
-        Files.deleteIfExists(absolutePath);
+        removeRegularFileIfExists(absolutePath);
         Files.move(tmpPath, absolutePath, StandardCopyOption.REPLACE_EXISTING);
 
         ParsedPayload complete = request(
@@ -250,8 +256,10 @@ public class FsService {
         if (!Files.exists(root) || !Files.isDirectory(root)) {
             throw new IllegalArgumentException("fs root must exist and be directory");
         }
+        invalidateSessions();
         this.rootDir = root;
         this.policy = nextPolicy != null ? nextPolicy : FsPolicy.defaults();
+        this.rootGeneration += 1;
         if (!serviceRegistered) {
             node.registerService(SERVICE, event -> CompletableFuture.completedFuture(handleServiceRequest(event.getPayloadFrames())));
             serviceRegistered = true;
@@ -368,6 +376,7 @@ public class FsService {
 
     private List<byte[]> handleDelete(Map<String, Object> meta) throws Exception {
         ResolvedPath target = resolveWritePath(str(meta.get("path")), OPS_DELETE, false);
+        forbidRootMutation(target.relativePath, OPS_DELETE);
         removeIfExists(target.absolutePath);
         Map<String, Object> ok = okMeta(OPS_DELETE);
         ok.put("path", str(meta.get("path")));
@@ -377,6 +386,8 @@ public class FsService {
     private List<byte[]> handleRename(Map<String, Object> meta) throws Exception {
         ResolvedPath from = resolveWritePath(str(meta.get("from")), OPS_RENAME, false);
         ResolvedPath to = resolveWritePath(str(meta.get("to")), OPS_RENAME, true);
+        forbidRootMutation(from.relativePath, OPS_RENAME);
+        forbidRootMutation(to.relativePath, OPS_RENAME);
         BasicFileAttributes fromStat = lstat(from.absolutePath);
         if (fromStat.isSymbolicLink()) {
             throw new IllegalArgumentException("refuse rename symlink");
@@ -386,6 +397,12 @@ public class FsService {
             if (toStat.isSymbolicLink()) {
                 throw new IllegalArgumentException("refuse overwrite symlink");
             }
+            if (fromStat.isDirectory() != toStat.isDirectory()) {
+                throw new IllegalArgumentException("refuse rename across file/directory types");
+            }
+        }
+        if (fromStat.isDirectory() && to.absolutePath.startsWith(from.absolutePath)) {
+            throw new IllegalArgumentException("refuse renaming directory into its own descendant");
         }
         Files.createDirectories(to.absolutePath.getParent());
         Files.move(from.absolutePath, to.absolutePath, StandardCopyOption.REPLACE_EXISTING);
@@ -397,6 +414,7 @@ public class FsService {
 
     private List<byte[]> handlePatch(Map<String, Object> meta) throws Exception {
         ResolvedPath target = resolveWritePath(str(meta.get("path")), OPS_PATCH, false);
+        forbidRootMutation(target.relativePath, OPS_PATCH);
         BasicFileAttributes stat = lstat(target.absolutePath);
         if (stat.isSymbolicLink() || !stat.isRegularFile()) {
             throw new IllegalArgumentException("target is not regular file");
@@ -432,8 +450,17 @@ public class FsService {
             return buildRpcPayload(ok, Collections.emptyList());
         }
 
-        Path tmp = Paths.get(target.absolutePath.toString() + ".patch.tmp");
-        Files.writeString(tmp, patched, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Path tmp = Files.createTempFile(target.absolutePath.getParent(), target.absolutePath.getFileName().toString() + ".patch-", ".tmp");
+        if (isWindowsReparsePoint(tmp) || lstat(tmp).isSymbolicLink()) {
+            throw new IllegalArgumentException("refuse patch temp link");
+        }
+        Files.writeString(tmp, patched, StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING);
+        if (Files.exists(target.absolutePath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes targetAttrs = lstat(target.absolutePath);
+            if (targetAttrs.isSymbolicLink() || targetAttrs.isDirectory() || isWindowsReparsePoint(target.absolutePath) || !targetAttrs.isRegularFile()) {
+                throw new IllegalArgumentException("refuse patch target replacement");
+            }
+        }
         Files.move(tmp, target.absolutePath, StandardCopyOption.REPLACE_EXISTING);
         ok.put("applied", true);
         return buildRpcPayload(ok, Collections.emptyList());
@@ -441,20 +468,15 @@ public class FsService {
 
     private List<byte[]> handleInit(Map<String, Object> meta) throws Exception {
         String sessionId = toSessionId(meta.get("sessionId"));
-        int chunkSize = normalizeChunkSize((int) toLong(meta.get("chunkSize"), DEFAULT_CHUNK_SIZE));
-        ResolvedPath target = resolveWritePath(str(meta.get("path")), OPS_INIT, true);
-        Path tmp = Paths.get(target.absolutePath.toString() + ".tmp");
-
-        if (Files.exists(tmp, LinkOption.NOFOLLOW_LINKS)) {
-            BasicFileAttributes a = lstat(tmp);
-            if (a.isSymbolicLink()) {
-                throw new IllegalArgumentException("refuse symlink tmp file");
-            }
+        if (sessions.containsKey(sessionId)) {
+            throw new IllegalArgumentException("sessionId already exists");
         }
-
-        Files.createDirectories(tmp.getParent());
-        if (!Files.exists(tmp)) {
-            Files.createFile(tmp);
+        int chunkSize = normalizeChunkSize((int) toLong(meta.get("chunkSize"), DEFAULT_CHUNK_SIZE));
+        ResolvedPath target = resolveUploadTarget(meta);
+        forbidRootMutation(target.relativePath, OPS_INIT);
+        Path tmp = Files.createTempFile(target.absolutePath.getParent(), target.absolutePath.getFileName().toString() + ".upload-", ".tmp");
+        if (isWindowsReparsePoint(tmp) || lstat(tmp).isSymbolicLink()) {
+            throw new IllegalArgumentException("refuse symlink tmp file");
         }
         long offset = Files.size(tmp);
 
@@ -466,6 +488,8 @@ public class FsService {
         s.tmpPath = tmp;
         s.chunkSize = chunkSize;
         s.fileSize = toLong(meta.get("fileSize"), 0L);
+        s.requestPath = str(meta.get("path"));
+        s.rootGeneration = rootGeneration;
         touchSession(s);
         sessions.put(sessionId, s);
 
@@ -477,12 +501,53 @@ public class FsService {
         return buildRpcPayload(ok, Collections.emptyList());
     }
 
+    private ResolvedPath resolveUploadTarget(Map<String, Object> meta) throws Exception {
+        String inputPath = str(meta.get("path"));
+        String fileName = str(meta.get("fileName")).trim();
+        ResolvedPath initial = resolveWritePath(inputPath, OPS_INIT, true);
+
+        Path existing = initial.absolutePath;
+        boolean looksLikeDirectory = inputPath.trim().isEmpty()
+                || ".".equals(inputPath.trim())
+                || "/".equals(toPosixPath(inputPath).trim())
+                || toPosixPath(inputPath).endsWith("/");
+
+        if (Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes attrs = lstat(existing);
+            if (attrs.isSymbolicLink()) {
+                throw new IllegalArgumentException("refuse upload target symlink");
+            }
+            if (attrs.isDirectory()) {
+                looksLikeDirectory = true;
+            }
+        }
+
+        if (!looksLikeDirectory) {
+            return initial;
+        }
+        if (fileName.isEmpty()) {
+            throw new IllegalArgumentException("upload target directory requires fileName");
+        }
+
+        String normalizedInput = toPosixPath(inputPath).trim();
+        String childPath;
+        if (normalizedInput.isEmpty() || ".".equals(normalizedInput) || "/".equals(normalizedInput)) {
+            childPath = fileName;
+        } else if (normalizedInput.endsWith("/")) {
+            childPath = normalizedInput + fileName;
+        } else {
+            childPath = normalizedInput + "/" + fileName;
+        }
+        return resolveWritePath(childPath, OPS_INIT, true);
+    }
+
     private List<byte[]> handleChunk(Map<String, Object> meta, List<byte[]> body) throws Exception {
         String sessionId = toSessionId(meta.get("sessionId"));
         Session s = sessions.get(sessionId);
         if (s == null || !"upload".equals(s.mode)) {
             throw new IllegalArgumentException("upload session not exists or expired");
         }
+        validateActiveSession(s, OPS_CHUNK, str(meta.get("path")));
 
         enforcePathPolicy(policy, s.relativePath, OPS_CHUNK, true);
         touchSession(s);
@@ -499,6 +564,13 @@ public class FsService {
 
         if (offset != expectedOffset || currentChunkId != expectedChunkId) {
             throw new IllegalArgumentException("chunk offset mismatch: expected=" + expectedOffset + ", actual=" + offset);
+        }
+
+        if (Files.exists(s.tmpPath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes tmpAttrs = lstat(s.tmpPath);
+            if (tmpAttrs.isSymbolicLink() || isWindowsReparsePoint(s.tmpPath) || tmpAttrs.isDirectory()) {
+                throw new IllegalArgumentException("refuse unsafe upload temp path");
+            }
         }
 
         try (var ch = java.nio.channels.FileChannel.open(s.tmpPath, StandardOpenOption.WRITE)) {
@@ -521,17 +593,31 @@ public class FsService {
         if (s == null || !"upload".equals(s.mode)) {
             throw new IllegalArgumentException("upload session not exists or expired");
         }
+        validateActiveSession(s, OPS_COMPLETE, str(meta.get("path")));
 
         enforcePathPolicy(policy, s.relativePath, OPS_COMPLETE, true);
-        if (Files.exists(s.tmpPath, LinkOption.NOFOLLOW_LINKS) && lstat(s.tmpPath).isSymbolicLink()) {
-            throw new IllegalArgumentException("refuse symlink tmp file");
+        if (Files.exists(s.tmpPath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes tmpAttrs = lstat(s.tmpPath);
+            if (tmpAttrs.isSymbolicLink() || isWindowsReparsePoint(s.tmpPath) || tmpAttrs.isDirectory() || !tmpAttrs.isRegularFile()) {
+                throw new IllegalArgumentException("refuse unsafe upload temp path");
+            }
         }
         if (Files.exists(s.targetPath, LinkOption.NOFOLLOW_LINKS) && lstat(s.targetPath).isSymbolicLink()) {
             throw new IllegalArgumentException("refuse overwrite symlink");
         }
 
+        if (Files.exists(s.targetPath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes targetAttrs = lstat(s.targetPath);
+            if (targetAttrs.isDirectory()) {
+                throw new IllegalArgumentException("refuse replacing directory with uploaded file");
+            }
+            if (isWindowsReparsePoint(s.targetPath)) {
+                throw new IllegalArgumentException("refuse overwrite reparse point");
+            }
+        }
+
         Files.createDirectories(s.targetPath.getParent());
-        removeIfExists(s.targetPath);
+        removeRegularFileIfExists(s.targetPath);
         Files.move(s.tmpPath, s.targetPath, StandardCopyOption.REPLACE_EXISTING);
         sessions.remove(sessionId);
 
@@ -544,6 +630,9 @@ public class FsService {
 
     private List<byte[]> handleDownloadInit(Map<String, Object> meta) throws Exception {
         String sessionId = toSessionId(meta.get("sessionId"));
+        if (sessions.containsKey(sessionId)) {
+            throw new IllegalArgumentException("sessionId already exists");
+        }
         int chunkSize = normalizeChunkSize((int) toLong(meta.get("chunkSize"), DEFAULT_CHUNK_SIZE));
         ResolvedPath target = resolveReadPath(str(meta.get("path")), OPS_DOWNLOAD_INIT);
 
@@ -566,6 +655,8 @@ public class FsService {
         s.relativePath = target.relativePath;
         s.chunkSize = chunkSize;
         s.fileSize = fileSize;
+        s.requestPath = str(meta.get("path"));
+        s.rootGeneration = rootGeneration;
         touchSession(s);
         sessions.put(sessionId, s);
 
@@ -584,6 +675,7 @@ public class FsService {
         if (s == null || !"download".equals(s.mode)) {
             throw new IllegalArgumentException("download session not exists or expired");
         }
+        validateActiveSession(s, OPS_DOWNLOAD_CHUNK, str(meta.get("path")));
 
         enforcePathPolicy(policy, s.relativePath, OPS_DOWNLOAD_CHUNK, false);
         touchSession(s);
@@ -594,8 +686,8 @@ public class FsService {
         }
 
         BasicFileAttributes fs = lstat(s.targetPath);
-        if (fs.isSymbolicLink()) {
-            throw new IllegalArgumentException("refuse read symlink");
+        if (fs.isSymbolicLink() || isWindowsReparsePoint(s.targetPath) || !fs.isRegularFile()) {
+            throw new IllegalArgumentException("refuse reading unsafe download source");
         }
 
         int size = (int) Math.min(s.chunkSize, s.fileSize - offset);
@@ -618,6 +710,7 @@ public class FsService {
         if (s == null || !"download".equals(s.mode)) {
             throw new IllegalArgumentException("download session not exists or expired");
         }
+        validateActiveSession(s, OPS_DOWNLOAD_COMPLETE, str(meta.get("path")));
         sessions.remove(sessionId);
 
         Map<String, Object> ok = okMeta(OPS_DOWNLOAD_COMPLETE);
@@ -780,10 +873,19 @@ public class FsService {
         }
         Path p = Paths.get(raw);
         if (p.isAbsolute()) {
+            if (p.getNameCount() == 0) {
+                throw new IllegalArgumentException("absolute root path is forbidden");
+            }
             Path root = p.getRoot();
             return root != null ? root.relativize(p).toString() : p.toString();
         }
         return raw;
+    }
+
+    private void forbidRootMutation(String relativePath, String op) {
+        if (relativePath == null || relativePath.isEmpty()) {
+            throw new IllegalArgumentException("operation on fs root is forbidden: " + op);
+        }
     }
 
     private static String normalizePatchText(String rawPatch) {
@@ -817,6 +919,10 @@ public class FsService {
                     .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
                     .forEach(p -> {
                         try {
+                            BasicFileAttributes childAttrs = lstat(p);
+                            if (childAttrs.isSymbolicLink() || isWindowsReparsePoint(p)) {
+                                throw new IllegalArgumentException("refuse deleting tree containing symlink/reparse point");
+                            }
                             Files.deleteIfExists(p);
                         } catch (IOException e) {
                             throw new RuntimeException(e);
@@ -825,6 +931,15 @@ public class FsService {
         } else {
             Files.deleteIfExists(target);
         }
+    }
+
+    private static void removeRegularFileIfExists(Path target) throws IOException {
+        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return;
+        BasicFileAttributes attrs = lstat(target);
+        if (attrs.isSymbolicLink() || attrs.isDirectory() || isWindowsReparsePoint(target) || !attrs.isRegularFile()) {
+            throw new IllegalArgumentException("refuse removing non-regular destination");
+        }
+        Files.deleteIfExists(target);
     }
 
     private static byte[] readRange(Path path, long offset, int size) throws IOException {
@@ -857,10 +972,41 @@ public class FsService {
             sessions.remove(entry.getKey());
             if ("upload".equals(s.mode) && s.tmpPath != null) {
                 try {
-                    Files.deleteIfExists(s.tmpPath);
+                    if (Files.exists(s.tmpPath, LinkOption.NOFOLLOW_LINKS)) {
+                        BasicFileAttributes attrs = lstat(s.tmpPath);
+                        if (!attrs.isSymbolicLink() && !attrs.isDirectory() && !isWindowsReparsePoint(s.tmpPath)) {
+                            Files.deleteIfExists(s.tmpPath);
+                        }
+                    }
                 } catch (Exception ignored) {
                 }
             }
+        }
+    }
+
+    private void invalidateSessions() {
+        for (Session s : sessions.values()) {
+            if ("upload".equals(s.mode) && s.tmpPath != null) {
+                try {
+                    if (Files.exists(s.tmpPath, LinkOption.NOFOLLOW_LINKS)) {
+                        BasicFileAttributes attrs = lstat(s.tmpPath);
+                        if (!attrs.isSymbolicLink() && !attrs.isDirectory() && !isWindowsReparsePoint(s.tmpPath)) {
+                            Files.deleteIfExists(s.tmpPath);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        sessions.clear();
+    }
+
+    private void validateActiveSession(Session session, String op, String requestPath) {
+        if (session.rootGeneration != rootGeneration) {
+            throw new IllegalArgumentException("session invalid after fs root change: " + op);
+        }
+        if (!str(session.requestPath).equals(str(requestPath))) {
+            throw new IllegalArgumentException("session path mismatch: " + op);
         }
     }
 
@@ -1034,9 +1180,11 @@ public class FsService {
         private String sessionId;
         private Path targetPath;
         private String relativePath;
+        private String requestPath;
         private Path tmpPath;
         private int chunkSize;
         private long fileSize;
+        private long rootGeneration;
         private long updatedAt;
         private long expiresAt;
     }

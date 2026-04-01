@@ -10,6 +10,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -311,6 +312,210 @@ public class NodeJsIntegrationTest {
             if (fsProcess != null && fsProcess.isAlive()) {
                 fsProcess.destroyForcibly();
             }
+            slave.stop().join();
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+        }
+    }
+
+    @Test
+    public void testNodeMasterUploadIntoDirectoryToJavaSlave() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-dir-upload-");
+        Files.createDirectories(root.resolve("public"));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-fs-dir-upload");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6012");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(
+                false,
+                true,
+                true,
+                true,
+                java.util.Collections.singletonList("public/**"),
+                java.util.Collections.emptyList()
+        ));
+
+        File scriptFile = new File("src/test/resources/test-node-master-fs-dir-upload.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js master fs dir upload script not found");
+
+        Process fsProcess = null;
+        try {
+            slave.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+            assertEquals(0, fsProcess.waitFor(20, TimeUnit.SECONDS) ? fsProcess.exitValue() : -1, "Node.js fs dir upload helper did not exit cleanly");
+
+            assertTrue(Files.isDirectory(root.resolve("public")), "public directory should remain a directory");
+            try (var stream = Files.list(root.resolve("public"))) {
+                Path uploaded = stream.filter(Files::isRegularFile).findFirst().orElseThrow();
+                assertEquals("dir-upload-content", Files.readString(uploaded, StandardCharsets.UTF_8));
+            }
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            slave.stop().join();
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+        }
+    }
+
+    @Test
+    public void testJavaSlaveUploadIntoExistingDirectoryKeepsDirectory() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-dir-guard-");
+        Files.createDirectories(root.resolve("public").resolve("existing-dir"));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-dir-guard");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6013");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(false, true, true, true, Collections.singletonList("public/**"), Collections.emptyList()));
+
+        Path upload = Files.createTempFile("znl-upload-guard-", ".txt");
+        Files.writeString(upload, "guard-content", StandardCharsets.UTF_8);
+
+        ZmqClusterNodeOptions masterOptions = new ZmqClusterNodeOptions();
+        masterOptions.setRole("master");
+        masterOptions.setId("java-master-dir-guard");
+        masterOptions.setAuthKey("test-secret-key");
+        masterOptions.setEncrypted(true);
+        masterOptions.getEndpoints().put("router", "tcp://127.0.0.1:6013");
+
+        ZmqClusterNode master = new ZmqClusterNode(masterOptions);
+        try {
+            slave.start().join();
+            master.start().join();
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("java-slave-dir-guard")) {
+                Thread.sleep(100);
+            }
+
+            master.fs().upload("java-slave-dir-guard", upload.toString(), "public/existing-dir", 3000, 0, null);
+            assertTrue(Files.isDirectory(root.resolve("public").resolve("existing-dir")));
+            assertEquals("guard-content", Files.readString(root.resolve("public").resolve("existing-dir").resolve(upload.getFileName()), StandardCharsets.UTF_8));
+        } finally {
+            master.stop().join();
+            slave.stop().join();
+            Files.deleteIfExists(upload);
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+        }
+    }
+
+    @Test
+    public void testJavaSlaveDeleteCannotRemoveFsRoot() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-root-guard-");
+        Files.createDirectories(root.resolve("public"));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-root-guard");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6014");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(false, true, true, true, Collections.emptyList(), Collections.emptyList()));
+
+        ZmqClusterNodeOptions masterOptions = new ZmqClusterNodeOptions();
+        masterOptions.setRole("master");
+        masterOptions.setId("java-master-root-guard");
+        masterOptions.setAuthKey("test-secret-key");
+        masterOptions.setEncrypted(true);
+        masterOptions.getEndpoints().put("router", "tcp://127.0.0.1:6014");
+
+        ZmqClusterNode master = new ZmqClusterNode(masterOptions);
+        try {
+            slave.start().join();
+            master.start().join();
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("java-slave-root-guard")) {
+                Thread.sleep(100);
+            }
+
+            Exception ex = assertThrows(Exception.class, () -> master.fs().delete("java-slave-root-guard", "/", 3000));
+            assertTrue(ex.getMessage().contains("root") || ex.getMessage().contains("forbidden"));
+            assertTrue(Files.exists(root));
+            assertTrue(Files.isDirectory(root));
+        } finally {
+            master.stop().join();
+            slave.stop().join();
+            Files.walk(root)
+                    .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+        }
+    }
+
+    @Test
+    public void testJavaSlaveRenameDirectoryIntoDescendantFails() throws Exception {
+        Path root = Files.createTempDirectory("znl-fs-rename-guard-");
+        Files.createDirectories(root.resolve("public").resolve("dir").resolve("child"));
+
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("slave");
+        options.setId("java-slave-rename-guard");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6015");
+
+        ZmqClusterNode slave = new ZmqClusterNode(options);
+        slave.fs().setRoot(root, new FsPolicy(false, true, true, true, Collections.singletonList("public/**"), Collections.emptyList()));
+
+        ZmqClusterNodeOptions masterOptions = new ZmqClusterNodeOptions();
+        masterOptions.setRole("master");
+        masterOptions.setId("java-master-rename-guard");
+        masterOptions.setAuthKey("test-secret-key");
+        masterOptions.setEncrypted(true);
+        masterOptions.getEndpoints().put("router", "tcp://127.0.0.1:6015");
+
+        ZmqClusterNode master = new ZmqClusterNode(masterOptions);
+        try {
+            slave.start().join();
+            master.start().join();
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("java-slave-rename-guard")) {
+                Thread.sleep(100);
+            }
+
+            Exception ex = assertThrows(Exception.class, () -> master.fs().rename("java-slave-rename-guard", "public/dir", "public/dir/child/sub", 3000));
+            assertTrue(ex.getMessage().contains("descendant") || ex.getMessage().contains("refuse"));
+            assertTrue(Files.isDirectory(root.resolve("public").resolve("dir")));
+        } finally {
+            master.stop().join();
             slave.stop().join();
             Files.walk(root)
                     .sorted((a, b) -> Integer.compare(b.getNameCount(), a.getNameCount()))
