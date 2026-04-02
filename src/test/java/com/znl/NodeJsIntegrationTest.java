@@ -529,6 +529,46 @@ public class NodeJsIntegrationTest {
     }
 
     @Test
+    public void testJavaMasterFsCreateAndMkdirToNodeSlave() throws Exception {
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("master");
+        options.setId("java-master-create-mkdir");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6016");
+
+        ZmqClusterNode master = new ZmqClusterNode(options);
+        File scriptFile = new File("src/test/resources/test-node-slave-fs-create-mkdir.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js slave fs create/mkdir script not found");
+
+        Process fsProcess = null;
+        try {
+            master.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("node-slave-fs-create-mkdir")) {
+                Thread.sleep(100);
+            }
+            assertTrue(master.getSlaves().contains("node-slave-fs-create-mkdir"), "Node fs create/mkdir slave did not connect");
+
+            Map<String, Object> mkdir = master.fs().mkdir("node-slave-fs-create-mkdir", "public/nested/a", true, true, 3000);
+            assertEquals(true, mkdir.get("created"));
+
+            Map<String, Object> create = master.fs().create("node-slave-fs-create-mkdir", "public/nested/a/test.txt", true, false, 3000);
+            assertEquals(true, create.get("created"));
+
+            FsService.ParsedPayload get = master.fs().get("node-slave-fs-create-mkdir", "public/nested/a/test.txt");
+            assertEquals(0, get.getBody().get(0).length);
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            master.stop().join();
+        }
+    }
+
+    @Test
     public void testJavaMasterFsToNodeSlave() throws Exception {
         ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
         options.setRole("master");

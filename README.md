@@ -1,6 +1,6 @@
 # ZNL Java
 
-ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC、Pub/Sub、PUSH 与 Service 通信库，当前与 Node.js [ZNL v0.6.6](https://github.com/Lyrify-Cloud/ZNL) 的核心协议语义保持对齐。
+ZNL (ZeroMQ Node Link) 的 Java 实现版本。这是一个基于 ZeroMQ (JeroMQ) 的轻量级、高性能 RPC、Pub/Sub、PUSH 与 Service 通信库，当前与 Node.js [ZNL v0.6.8](https://github.com/Lyrify-Cloud/ZNL) 的核心协议语义保持对齐。
 
 ## 特性
 
@@ -101,6 +101,13 @@ slave.SUBSCRIBE("news", event -> {
 slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 ```
 
+## 0.6.8 对齐项
+
+- `master.fs.create(...)`：支持创建空文件。
+- `master.fs.mkdir(...)`：支持创建目录。
+- `upload(remotePath)` 目录语义对齐：支持 `.` / `./` / `.\`、结尾斜杠路径、已存在目录自动按目录处理。
+- 上传完成阶段继续加固，拒绝目录被文件覆盖。
+
 ## 0.6.6 对齐项
 
 - `svc_req/svc_res`：新增内部 service 控制帧与事件语义。
@@ -134,7 +141,7 @@ slave.PUSH("metrics", "{\"online\":42}".getBytes()).join();
 
 ## 版本说明
 
-- 当前库版本：`0.6.6`
+- 当前库版本：`0.6.8`
 - 底层 ZeroMQ Java 绑定：`jeromq 0.6.0`
 - `isMasterOnline()` 表示最近一次链路确认状态，不代表实时网络探测结果。
 
@@ -147,4 +154,4 @@ mvn test
 ```
 
 ## 协议兼容性
-本项目与 Node.js 版本的 [ZNL v0.6.6](https://github.com/Lyrify-Cloud/ZNL) 保持核心协议兼容，并对齐了 `heartbeat_ack`、`masterOnline`、`push`、`svc_req/svc_res`、断线重建 Dealer、认证失败事件上下文等语义。
+本项目与 Node.js 版本的 [ZNL v0.6.8](https://github.com/Lyrify-Cloud/ZNL) 保持核心协议兼容，并对齐了 `heartbeat_ack`、`masterOnline`、`push`、`svc_req/svc_res`、`fs create/mkdir`、`upload` 目录语义与断线重建 Dealer 等语义。

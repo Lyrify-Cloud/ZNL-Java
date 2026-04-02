@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.8
+
+- 对齐 Node.js ZNL `v0.6.7` / `v0.6.8` 的内建 `fs` 更新。
+- 新增 `master.fs.create(slaveId, path, recursive, overwrite, timeoutMs)`，支持创建空文件。
+- 新增 `master.fs.mkdir(slaveId, path, recursive, existOk, timeoutMs)`，支持创建目录。
+- 对齐 `upload(remotePath)` 目录语义：支持 `.` / `./` / `.\`、结尾斜杠路径、已存在目录自动解析为目录目标并拼接源文件名。
+- 继续加固上传完成阶段，明确拒绝“已存在目录被文件覆盖”的危险写入。
+- 新增 Node Master -> Java Slave 与 Java Master -> Node Slave 的 `create/mkdir/upload-dir` 互通与回归测试。
+
 ## 0.6.6
 
 - 对齐 Node.js ZNL `v0.6.6` 的内部 service 通道协议：新增 `svc_req` / `svc_res` 控制帧解析与收发。

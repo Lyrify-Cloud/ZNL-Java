@@ -38,6 +38,8 @@ public class FsService {
     private static final int DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 
     private static final String OPS_LIST = "file/list";
+    private static final String OPS_CREATE = "file/create";
+    private static final String OPS_MKDIR = "file/mkdir";
     private static final String OPS_GET = "file/get";
     private static final String OPS_PATCH = "file/patch";
     private static final String OPS_INIT = "file/init";
@@ -83,6 +85,32 @@ public class FsService {
     public Map<String, Object> stat(String slaveId, String targetPath, int timeoutMs) throws Exception {
         ParsedPayload parsed = request(slaveId, mapOf("service", SERVICE, "op", OPS_STAT, "path", str(targetPath)), Collections.emptyList(), timeoutMs);
         return assertOk(parsed.meta, OPS_STAT);
+    }
+
+    public Map<String, Object> create(String slaveId, String targetPath) throws Exception {
+        return create(slaveId, targetPath, true, false, DEFAULT_TIMEOUT_MS);
+    }
+
+    public Map<String, Object> create(String slaveId, String targetPath, boolean recursive, boolean overwrite, int timeoutMs) throws Exception {
+        ParsedPayload parsed = request(
+                slaveId,
+                mapOf("service", SERVICE, "op", OPS_CREATE, "path", str(targetPath), "recursive", recursive, "overwrite", overwrite),
+                Collections.emptyList(),
+                timeoutMs);
+        return assertOk(parsed.meta, OPS_CREATE);
+    }
+
+    public Map<String, Object> mkdir(String slaveId, String targetPath) throws Exception {
+        return mkdir(slaveId, targetPath, true, true, DEFAULT_TIMEOUT_MS);
+    }
+
+    public Map<String, Object> mkdir(String slaveId, String targetPath, boolean recursive, boolean existOk, int timeoutMs) throws Exception {
+        ParsedPayload parsed = request(
+                slaveId,
+                mapOf("service", SERVICE, "op", OPS_MKDIR, "path", str(targetPath), "recursive", recursive, "existOk", existOk),
+                Collections.emptyList(),
+                timeoutMs);
+        return assertOk(parsed.meta, OPS_MKDIR);
     }
 
     public ParsedPayload get(String slaveId, String targetPath) throws Exception {
@@ -295,6 +323,10 @@ public class FsService {
                     return handleList(meta);
                 case OPS_STAT:
                     return handleStat(meta);
+                case OPS_CREATE:
+                    return handleCreate(meta);
+                case OPS_MKDIR:
+                    return handleMkdir(meta);
                 case OPS_GET:
                     return handleGet(meta);
                 case OPS_DELETE:
@@ -372,6 +404,96 @@ public class FsService {
         ok.put("path", str(meta.get("path")));
         ok.put("size", bytes.length);
         return buildRpcPayload(ok, Collections.singletonList(bytes));
+    }
+
+    private List<byte[]> handleCreate(Map<String, Object> meta) throws Exception {
+        ResolvedPath target = resolveWritePath(str(meta.get("path")), OPS_CREATE, true);
+        forbidRootMutation(target.relativePath, OPS_CREATE);
+
+        boolean recursive = !Boolean.FALSE.equals(meta.get("recursive"));
+        boolean overwrite = Boolean.TRUE.equals(meta.get("overwrite"));
+
+        if (Files.exists(target.absolutePath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes attrs = lstat(target.absolutePath);
+            if (attrs.isSymbolicLink() || isWindowsReparsePoint(target.absolutePath)) {
+                throw new IllegalArgumentException("refuse create on symlink/reparse point");
+            }
+            if (attrs.isDirectory()) {
+                throw new IllegalArgumentException("refuse create on directory target");
+            }
+            if (!attrs.isRegularFile()) {
+                throw new IllegalArgumentException("refuse create on non-regular target");
+            }
+            if (!overwrite) {
+                throw new IllegalArgumentException("target already exists");
+            }
+        }
+
+        Path parent = target.absolutePath.getParent();
+        if (recursive) {
+            Files.createDirectories(parent);
+        } else {
+            if (parent == null || !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IllegalArgumentException("parent directory not exists");
+            }
+            BasicFileAttributes parentAttrs = lstat(parent);
+            if (parentAttrs.isSymbolicLink() || isWindowsReparsePoint(parent) || !parentAttrs.isDirectory()) {
+                throw new IllegalArgumentException("parent is not a safe directory");
+            }
+        }
+
+        Files.write(target.absolutePath, new byte[0], StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+
+        Map<String, Object> ok = okMeta(OPS_CREATE);
+        ok.put("path", str(meta.get("path")));
+        ok.put("created", true);
+        ok.put("overwritten", Files.exists(target.absolutePath, LinkOption.NOFOLLOW_LINKS));
+        return buildRpcPayload(ok, Collections.emptyList());
+    }
+
+    private List<byte[]> handleMkdir(Map<String, Object> meta) throws Exception {
+        ResolvedPath target = resolveWritePath(str(meta.get("path")), OPS_MKDIR, true);
+        forbidRootMutation(target.relativePath, OPS_MKDIR);
+
+        boolean recursive = !Boolean.FALSE.equals(meta.get("recursive"));
+        boolean existOk = !Boolean.FALSE.equals(meta.get("existOk"));
+
+        if (Files.exists(target.absolutePath, LinkOption.NOFOLLOW_LINKS)) {
+            BasicFileAttributes attrs = lstat(target.absolutePath);
+            if (attrs.isSymbolicLink() || isWindowsReparsePoint(target.absolutePath)) {
+                throw new IllegalArgumentException("refuse mkdir on symlink/reparse point");
+            }
+            if (!attrs.isDirectory()) {
+                throw new IllegalArgumentException("target exists and is not a directory");
+            }
+            if (!existOk) {
+                throw new IllegalArgumentException("directory already exists");
+            }
+
+            Map<String, Object> ok = okMeta(OPS_MKDIR);
+            ok.put("path", str(meta.get("path")));
+            ok.put("created", true);
+            ok.put("existed", true);
+            return buildRpcPayload(ok, Collections.emptyList());
+        }
+
+        Path parent = target.absolutePath.getParent();
+        if (!recursive) {
+            if (parent == null || !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IllegalArgumentException("parent directory not exists");
+            }
+            BasicFileAttributes parentAttrs = lstat(parent);
+            if (parentAttrs.isSymbolicLink() || isWindowsReparsePoint(parent) || !parentAttrs.isDirectory()) {
+                throw new IllegalArgumentException("parent is not a safe directory");
+            }
+        }
+
+        Files.createDirectories(target.absolutePath);
+        Map<String, Object> ok = okMeta(OPS_MKDIR);
+        ok.put("path", str(meta.get("path")));
+        ok.put("created", true);
+        ok.put("existed", false);
+        return buildRpcPayload(ok, Collections.emptyList());
     }
 
     private List<byte[]> handleDelete(Map<String, Object> meta) throws Exception {
@@ -507,10 +629,14 @@ public class FsService {
         ResolvedPath initial = resolveWritePath(inputPath, OPS_INIT, true);
 
         Path existing = initial.absolutePath;
+        String normalizedInput = toPosixPath(inputPath).trim();
         boolean looksLikeDirectory = inputPath.trim().isEmpty()
                 || ".".equals(inputPath.trim())
+                || "./".equals(normalizedInput)
+                || ".\\".equals(inputPath.trim())
                 || "/".equals(toPosixPath(inputPath).trim())
-                || toPosixPath(inputPath).endsWith("/");
+                || toPosixPath(inputPath).endsWith("/")
+                || inputPath.endsWith("\\");
 
         if (Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
             BasicFileAttributes attrs = lstat(existing);
@@ -529,7 +655,6 @@ public class FsService {
             throw new IllegalArgumentException("upload target directory requires fileName");
         }
 
-        String normalizedInput = toPosixPath(inputPath).trim();
         String childPath;
         if (normalizedInput.isEmpty() || ".".equals(normalizedInput) || "/".equals(normalizedInput)) {
             childPath = fileName;
