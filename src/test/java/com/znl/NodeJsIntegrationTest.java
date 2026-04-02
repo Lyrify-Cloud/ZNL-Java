@@ -234,7 +234,10 @@ public class NodeJsIntegrationTest {
         Files.createDirectories(root.resolve("public"));
         Files.createDirectories(root.resolve("secret"));
         Files.write(root.resolve("public").resolve("a.txt"), "hello-public".getBytes(StandardCharsets.UTF_8));
+        Files.write(root.resolve("public").resolve("data.bin"), new byte[] {0x10, 0x20, 0x30, 0x40});
+        Files.writeString(root.resolve("public").resolve("large.txt"), "x".repeat(6000), StandardCharsets.UTF_8);
         Files.write(root.resolve("secret").resolve("hidden.txt"), "secret-data".getBytes(StandardCharsets.UTF_8));
+
 
         ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
         options.setRole("slave");
@@ -250,8 +253,11 @@ public class NodeJsIntegrationTest {
                 true,
                 true,
                 java.util.Collections.singletonList("public/**"),
-                java.util.Collections.singletonList("secret/**")
+                java.util.Collections.singletonList("secret/**"),
+                java.util.Collections.singletonList("txt"),
+                0.001d
         ));
+
 
         File scriptFile = new File("src/test/resources/test-node-master-fs-policy.js").getAbsoluteFile();
         assertTrue(scriptFile.exists(), "Node.js master fs policy script not found");
@@ -634,7 +640,98 @@ public class NodeJsIntegrationTest {
         }
     }
 
+    @Test
+    public void testJavaMasterFsGetRestrictionsAndProgressToNodeSlave() throws Exception {
+        ZmqClusterNodeOptions options = new ZmqClusterNodeOptions();
+        options.setRole("master");
+        options.setId("java-master-fs-get-guard");
+        options.setAuthKey("test-secret-key");
+        options.setEncrypted(true);
+        options.getEndpoints().put("router", "tcp://127.0.0.1:6017");
+
+        ZmqClusterNode master = new ZmqClusterNode(options);
+        File scriptFile = new File("src/test/resources/test-node-slave-fs-get-guard.js").getAbsoluteFile();
+        assertTrue(scriptFile.exists(), "Node.js slave fs get guard script not found");
+
+        Process fsProcess = null;
+        try {
+            master.start().join();
+            fsProcess = startNodeProcess(scriptFile);
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (System.currentTimeMillis() < deadline && !master.getSlaves().contains("node-slave-fs-get-guard")) {
+                Thread.sleep(100);
+            }
+            assertTrue(master.getSlaves().contains("node-slave-fs-get-guard"), "Node fs get guard slave did not connect");
+
+            FsService.ParsedPayload allowed = master.fs().get("node-slave-fs-get-guard", "public/allowed.txt");
+            assertEquals("allowed-text", new String(allowed.getBody().get(0), StandardCharsets.UTF_8));
+
+            Exception extEx = assertThrows(Exception.class, () -> master.fs().get("node-slave-fs-get-guard", "public/binary.bin"));
+            assertTrue(extEx.getMessage().toLowerCase().contains("download"));
+
+            Exception sizeEx = assertThrows(Exception.class, () -> master.fs().get("node-slave-fs-get-guard", "public/large.txt"));
+            assertTrue(sizeEx.getMessage().toLowerCase().contains("download"));
+
+            Path binaryDownload = Files.createTempFile("znl-java-progress-binary-", ".bin");
+            Path largeDownload = Files.createTempFile("znl-java-progress-large-", ".txt");
+            master.fs().download("node-slave-fs-get-guard", "public/binary.bin", binaryDownload.toString());
+            master.fs().download("node-slave-fs-get-guard", "public/large.txt", largeDownload.toString());
+            assertArrayEquals(new byte[] {1, 2, 3, 4}, Files.readAllBytes(binaryDownload));
+            assertEquals("x".repeat(1400), Files.readString(largeDownload, StandardCharsets.UTF_8));
+
+            Path download = Files.createTempFile("znl-java-progress-download-", ".txt");
+            Path upload = Files.createTempFile("znl-java-progress-upload-", ".txt");
+            try {
+                java.util.List<Map<String, Object>> downloadEvents = new java.util.ArrayList<>();
+                master.fs().download("node-slave-fs-get-guard", "public/allowed.txt", download.toString(), 3000, 64 * 1024, null, downloadEvents::add);
+                assertFalse(downloadEvents.isEmpty());
+                assertEquals("init", downloadEvents.get(0).get("phase"));
+                assertEquals("download", downloadEvents.get(0).get("direction"));
+                assertEquals("complete", downloadEvents.get(downloadEvents.size() - 1).get("phase"));
+                assertTrue(downloadEvents.stream().anyMatch(e -> "chunk".equals(e.get("phase"))) || downloadEvents.size() >= 2);
+                assertEquals("allowed-text", Files.readString(download, StandardCharsets.UTF_8));
+
+                Files.writeString(upload, "java-progress-upload", StandardCharsets.UTF_8);
+                java.util.List<Map<String, Object>> uploadEvents = new java.util.ArrayList<>();
+                master.fs().upload("node-slave-fs-get-guard", upload.toString(), "public/uploaded.txt", 3000, 64 * 1024, null, uploadEvents::add);
+                assertFalse(uploadEvents.isEmpty());
+                assertEquals("init", uploadEvents.get(0).get("phase"));
+                assertEquals("upload", uploadEvents.get(0).get("direction"));
+                assertEquals("complete", uploadEvents.get(uploadEvents.size() - 1).get("phase"));
+                assertTrue(uploadEvents.stream().anyMatch(e -> "chunk".equals(e.get("phase"))) || uploadEvents.size() >= 2);
+
+                FsService.ParsedPayload uploaded = master.fs().get("node-slave-fs-get-guard", "public/uploaded.txt");
+                assertEquals("java-progress-upload", new String(uploaded.getBody().get(0), StandardCharsets.UTF_8));
+
+                Map<String, Object> sampleChunk = uploadEvents.stream()
+                        .filter(e -> "chunk".equals(e.get("phase")))
+                        .findFirst()
+                        .orElse(uploadEvents.get(uploadEvents.size() - 1));
+                assertTrue(sampleChunk.containsKey("transferred"));
+                assertTrue(sampleChunk.containsKey("total"));
+                assertTrue(sampleChunk.containsKey("percent"));
+                assertTrue(sampleChunk.containsKey("speedBps"));
+                assertTrue(sampleChunk.containsKey("etaSeconds"));
+                assertTrue(sampleChunk.containsKey("chunkId"));
+                assertTrue(sampleChunk.containsKey("totalChunks"));
+                assertTrue(sampleChunk.containsKey("size"));
+            } finally {
+                Files.deleteIfExists(binaryDownload);
+                Files.deleteIfExists(largeDownload);
+                Files.deleteIfExists(download);
+                Files.deleteIfExists(upload);
+            }
+        } finally {
+            if (fsProcess != null && fsProcess.isAlive()) {
+                fsProcess.destroyForcibly();
+            }
+            master.stop().join();
+        }
+    }
+
     private static Process startNodeProcess(File scriptFile) throws Exception {
+
         ProcessBuilder pb = new ProcessBuilder("node", scriptFile.getAbsolutePath());
         pb.redirectErrorStream(true);
         Process process = pb.start();

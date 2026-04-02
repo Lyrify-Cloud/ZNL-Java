@@ -31,6 +31,11 @@ import java.util.regex.Pattern;
 
 public class FsService {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    public interface TransferProgressListener {
+        void onProgress(Map<String, Object> event);
+    }
+
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<Map<String, Object>>() {};
 
     private static final String SERVICE = "fs";
@@ -151,10 +156,18 @@ public class FsService {
     }
 
     public Map<String, Object> upload(String slaveId, String localPath, String remotePath) throws Exception {
-        return upload(slaveId, localPath, remotePath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null);
+        return upload(slaveId, localPath, remotePath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null, null);
+    }
+
+    public Map<String, Object> upload(String slaveId, String localPath, String remotePath, TransferProgressListener onProgress) throws Exception {
+        return upload(slaveId, localPath, remotePath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null, onProgress);
     }
 
     public Map<String, Object> upload(String slaveId, String localPath, String remotePath, int timeoutMs, int chunkSizeInput, String sessionIdInput) throws Exception {
+        return upload(slaveId, localPath, remotePath, timeoutMs, chunkSizeInput, sessionIdInput, null);
+    }
+
+    public Map<String, Object> upload(String slaveId, String localPath, String remotePath, int timeoutMs, int chunkSizeInput, String sessionIdInput, TransferProgressListener onProgress) throws Exception {
         ensureMaster();
         int chunkSize = normalizeChunkSize(chunkSizeInput);
         String sessionId = sessionIdInput != null && !sessionIdInput.isEmpty() ? sessionIdInput : createSessionId();
@@ -171,28 +184,68 @@ public class FsService {
                 timeoutMs);
         assertOk(initResp.meta, OPS_INIT);
 
-        long offset = toLong(initResp.meta.get("offset"), 0L);
+        long resumeOffset = toLong(initResp.meta.get("offset"), 0L);
+        long offset = resumeOffset > 0 ? resumeOffset : 0L;
         int totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
         int chunkId = (int) (offset / chunkSize);
+        ProgressCalculator calcProgress = new ProgressCalculator();
+        ProgressSnapshot initSnapshot = calcProgress.calculate(offset, fileSize, "init");
 
-        while (offset < fileSize) {
-            int readSize = (int) Math.min(chunkSize, fileSize - offset);
-            byte[] chunk = Files.readAllBytes(absolutePath).length == readSize && offset == 0
-                    ? Files.readAllBytes(absolutePath)
-                    : readRange(absolutePath, offset, readSize);
+        emitProgress(onProgress, mapOf(
+                "direction", "upload",
+                "phase", "init",
+                "slaveId", slaveId,
+                "sessionId", sessionId,
+                "localPath", absolutePath.toString(),
+                "remotePath", str(remotePath),
+                "transferred", offset,
+                "total", fileSize,
+                "totalChunks", totalChunks,
+                "chunkId", chunkId,
+                "percent", initSnapshot.percent,
+                "speedBps", initSnapshot.speedBps,
+                "etaSeconds", initSnapshot.etaSeconds
+        ));
 
-            ParsedPayload ack = request(
-                    slaveId,
-                    mapOf("service", SERVICE, "op", OPS_CHUNK, "sessionId", sessionId, "path", str(remotePath), "chunkId", chunkId, "totalChunks", totalChunks, "offset", offset, "size", chunk.length),
-                    Collections.singletonList(chunk),
-                    timeoutMs);
-            assertOk(ack.meta, OPS_CHUNK);
-            String ackOp = str(ack.meta.get("op"));
-            if (!ackOp.isEmpty() && !OPS_ACK.equals(ackOp)) {
-                throw new IllegalStateException("upload ACK op mismatch: " + ackOp);
+        try (var ch = java.nio.channels.FileChannel.open(absolutePath, StandardOpenOption.READ)) {
+            while (offset < fileSize) {
+                int readSize = (int) Math.min(chunkSize, fileSize - offset);
+                byte[] chunk = readRange(ch, offset, readSize);
+
+                ParsedPayload ack = request(
+                        slaveId,
+                        mapOf("service", SERVICE, "op", OPS_CHUNK, "sessionId", sessionId, "path", str(remotePath), "chunkId", chunkId, "totalChunks", totalChunks, "offset", offset, "size", chunk.length),
+                        Collections.singletonList(chunk),
+                        timeoutMs);
+                assertOk(ack.meta, OPS_CHUNK);
+                String ackOp = str(ack.meta.get("op"));
+                if (!ackOp.isEmpty() && !OPS_ACK.equals(ackOp)) {
+                    throw new IllegalStateException("upload ACK op mismatch: " + ackOp);
+                }
+                if (ack.meta.get("chunkId") != null && toLong(ack.meta.get("chunkId"), -1L) != chunkId) {
+                    throw new IllegalStateException("upload ACK chunkId mismatch: expected=" + chunkId + ", actual=" + ack.meta.get("chunkId"));
+                }
+                offset += chunk.length;
+                chunkId += 1;
+
+                ProgressSnapshot snapshot = calcProgress.calculate(offset, fileSize, "chunk");
+                emitProgress(onProgress, mapOf(
+                        "direction", "upload",
+                        "phase", "chunk",
+                        "slaveId", slaveId,
+                        "sessionId", sessionId,
+                        "localPath", absolutePath.toString(),
+                        "remotePath", str(remotePath),
+                        "transferred", offset,
+                        "total", fileSize,
+                        "percent", snapshot.percent,
+                        "speedBps", snapshot.speedBps,
+                        "etaSeconds", snapshot.etaSeconds,
+                        "chunkId", chunkId - 1,
+                        "totalChunks", totalChunks,
+                        "size", chunk.length
+                ));
             }
-            offset += chunk.length;
-            chunkId += 1;
         }
 
         ParsedPayload complete = request(
@@ -200,14 +253,41 @@ public class FsService {
                 mapOf("service", SERVICE, "op", OPS_COMPLETE, "sessionId", sessionId, "path", str(remotePath), "fileName", absolutePath.getFileName().toString(), "fileSize", fileSize, "totalChunks", totalChunks),
                 Collections.emptyList(),
                 timeoutMs);
-        return assertOk(complete.meta, OPS_COMPLETE);
+        Map<String, Object> meta = assertOk(complete.meta, OPS_COMPLETE);
+
+        ProgressSnapshot completeSnapshot = calcProgress.calculate(fileSize, fileSize, "complete");
+        Map<String, Object> completeEvent = mapOf(
+                "direction", "upload",
+                "phase", "complete",
+                "slaveId", slaveId,
+                "sessionId", sessionId,
+                "localPath", absolutePath.toString(),
+                "remotePath", str(remotePath),
+                "transferred", fileSize,
+                "total", fileSize,
+                "percent", completeSnapshot.percent,
+                "speedBps", completeSnapshot.speedBps,
+                "etaSeconds", completeSnapshot.etaSeconds,
+                "totalChunks", totalChunks,
+                "meta", meta
+        );
+        emitProgress(onProgress, completeEvent);
+        return meta;
     }
 
     public Map<String, Object> download(String slaveId, String remotePath, String localPath) throws Exception {
-        return download(slaveId, remotePath, localPath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null);
+        return download(slaveId, remotePath, localPath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null, null);
+    }
+
+    public Map<String, Object> download(String slaveId, String remotePath, String localPath, TransferProgressListener onProgress) throws Exception {
+        return download(slaveId, remotePath, localPath, DEFAULT_TIMEOUT_MS, DEFAULT_CHUNK_SIZE, null, onProgress);
     }
 
     public Map<String, Object> download(String slaveId, String remotePath, String localPath, int timeoutMs, int chunkSizeInput, String sessionIdInput) throws Exception {
+        return download(slaveId, remotePath, localPath, timeoutMs, chunkSizeInput, sessionIdInput, null);
+    }
+
+    public Map<String, Object> download(String slaveId, String remotePath, String localPath, int timeoutMs, int chunkSizeInput, String sessionIdInput, TransferProgressListener onProgress) throws Exception {
         ensureMaster();
         int chunkSize = normalizeChunkSize(chunkSizeInput);
         String sessionId = sessionIdInput != null && !sessionIdInput.isEmpty() ? sessionIdInput : createSessionId();
@@ -235,27 +315,63 @@ public class FsService {
         assertOk(initResp.meta, OPS_DOWNLOAD_INIT);
 
         long fileSize = toLong(initResp.meta.get("fileSize"), toLong(initResp.meta.get("size"), 0L));
-        offset = toLong(initResp.meta.get("offset"), offset);
+        offset = Math.max(0L, toLong(initResp.meta.get("offset"), offset));
         int totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
-        int chunkId = (int) (offset / chunkSize);
+        ProgressCalculator calcProgress = new ProgressCalculator();
+        int initialChunkId = (int) (offset / chunkSize);
+        ProgressSnapshot initSnapshot = calcProgress.calculate(offset, fileSize, "init");
+        emitProgress(onProgress, mapOf(
+                "direction", "download",
+                "phase", "init",
+                "slaveId", slaveId,
+                "sessionId", sessionId,
+                "remotePath", str(remotePath),
+                "localPath", absolutePath.toString(),
+                "transferred", offset,
+                "total", fileSize,
+                "percent", initSnapshot.percent,
+                "speedBps", initSnapshot.speedBps,
+                "etaSeconds", initSnapshot.etaSeconds,
+                "totalChunks", totalChunks,
+                "chunkId", initialChunkId
+        ));
 
-        while (offset < fileSize) {
-            ParsedPayload resp = request(
-                    slaveId,
-                    mapOf("service", SERVICE, "op", OPS_DOWNLOAD_CHUNK, "sessionId", sessionId, "path", str(remotePath), "chunkId", chunkId, "offset", offset, "chunkSize", chunkSize, "totalChunks", totalChunks),
-                    Collections.emptyList(),
-                    timeoutMs);
-            assertOk(resp.meta, OPS_DOWNLOAD_CHUNK);
-            if (resp.body.isEmpty() || resp.body.get(0) == null) {
-                throw new IllegalStateException("download chunk payload missing");
-            }
-            byte[] chunk = resp.body.get(0);
-            try (var ch = java.nio.channels.FileChannel.open(tmpPath, StandardOpenOption.WRITE)) {
+        try (var ch = java.nio.channels.FileChannel.open(tmpPath, StandardOpenOption.WRITE)) {
+            int chunkId = initialChunkId;
+            while (offset < fileSize) {
+                ParsedPayload resp = request(
+                        slaveId,
+                        mapOf("service", SERVICE, "op", OPS_DOWNLOAD_CHUNK, "sessionId", sessionId, "path", str(remotePath), "chunkId", chunkId, "offset", offset, "chunkSize", chunkSize, "totalChunks", totalChunks),
+                        Collections.emptyList(),
+                        timeoutMs);
+                assertOk(resp.meta, OPS_DOWNLOAD_CHUNK);
+                if (resp.body.isEmpty() || resp.body.get(0) == null) {
+                    throw new IllegalStateException("download chunk payload missing");
+                }
+                byte[] chunk = resp.body.get(0);
                 ch.position(offset);
                 ch.write(java.nio.ByteBuffer.wrap(chunk));
+                offset += chunk.length;
+                chunkId += 1;
+
+                ProgressSnapshot snapshot = calcProgress.calculate(offset, fileSize, "chunk");
+                emitProgress(onProgress, mapOf(
+                        "direction", "download",
+                        "phase", "chunk",
+                        "slaveId", slaveId,
+                        "sessionId", sessionId,
+                        "remotePath", str(remotePath),
+                        "localPath", absolutePath.toString(),
+                        "transferred", offset,
+                        "total", fileSize,
+                        "percent", snapshot.percent,
+                        "speedBps", snapshot.speedBps,
+                        "etaSeconds", snapshot.etaSeconds,
+                        "chunkId", chunkId - 1,
+                        "totalChunks", totalChunks,
+                        "size", chunk.length
+                ));
             }
-            offset += chunk.length;
-            chunkId += 1;
         }
 
         removeRegularFileIfExists(absolutePath);
@@ -266,7 +382,25 @@ public class FsService {
                 mapOf("service", SERVICE, "op", OPS_DOWNLOAD_COMPLETE, "sessionId", sessionId, "path", str(remotePath), "fileSize", fileSize, "totalChunks", totalChunks),
                 Collections.emptyList(),
                 timeoutMs);
-        return assertOk(complete.meta, OPS_DOWNLOAD_COMPLETE);
+        Map<String, Object> meta = assertOk(complete.meta, OPS_DOWNLOAD_COMPLETE);
+
+        ProgressSnapshot completeSnapshot = calcProgress.calculate(fileSize, fileSize, "complete");
+        emitProgress(onProgress, mapOf(
+                "direction", "download",
+                "phase", "complete",
+                "slaveId", slaveId,
+                "sessionId", sessionId,
+                "remotePath", str(remotePath),
+                "localPath", absolutePath.toString(),
+                "transferred", fileSize,
+                "total", fileSize,
+                "percent", completeSnapshot.percent,
+                "speedBps", completeSnapshot.speedBps,
+                "etaSeconds", completeSnapshot.etaSeconds,
+                "totalChunks", totalChunks,
+                "meta", meta
+        ));
+        return meta;
     }
 
     // slave API
@@ -399,6 +533,7 @@ public class FsService {
         if (attrs.isSymbolicLink() || !attrs.isRegularFile()) {
             throw new IllegalArgumentException("target is not regular file");
         }
+        ensureGetPolicyAccess(policy, target.absolutePath, attrs);
         byte[] bytes = Files.readAllBytes(target.absolutePath);
         Map<String, Object> ok = okMeta(OPS_GET);
         ok.put("path", str(meta.get("path")));
@@ -887,8 +1022,75 @@ public class FsService {
         return meta;
     }
 
-    private static String createSessionId() {
-        return System.currentTimeMillis() + "-" + UUID.randomUUID();
+    private static double progressPercent(long transferred, long total) {
+        if (total <= 0) return 100d;
+        if (transferred <= 0) return 0d;
+        return Math.max(0d, Math.min(100d, (((double) transferred) / ((double) total)) * 100d));
+    }
+
+    private static void emitProgress(TransferProgressListener listener, Map<String, Object> event) {
+        if (listener == null) return;
+        try {
+            listener.onProgress(event);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static final class ProgressSnapshot {
+        private final double percent;
+        private final double speedBps;
+        private final Double etaSeconds;
+
+        private ProgressSnapshot(double percent, double speedBps, Double etaSeconds) {
+            this.percent = percent;
+            this.speedBps = speedBps;
+            this.etaSeconds = etaSeconds;
+        }
+    }
+
+    private static final class ProgressCalculator {
+        private long startedAt;
+        private long lastSampleAt;
+        private long lastSampleBytes;
+        private double smoothedBps;
+
+        private ProgressSnapshot calculate(long transferred, long total, String phase) {
+            long now = System.currentTimeMillis();
+            long bytes = Math.max(0L, transferred);
+            long totalBytes = Math.max(0L, total);
+
+            if (startedAt == 0L || "init".equals(phase)) {
+                startedAt = now;
+                lastSampleAt = now;
+                lastSampleBytes = bytes;
+                smoothedBps = 0d;
+            }
+
+            long deltaMs = Math.max(0L, now - lastSampleAt);
+            long deltaBytes = Math.max(0L, bytes - lastSampleBytes);
+            if (deltaMs > 0L) {
+                double instantBps = (deltaBytes * 1000d) / deltaMs;
+                if (instantBps > 0d) {
+                    smoothedBps = smoothedBps > 0d ? (smoothedBps * 0.75d + instantBps * 0.25d) : instantBps;
+                }
+                lastSampleAt = now;
+                lastSampleBytes = bytes;
+            }
+
+            long elapsedMs = Math.max(1L, now - startedAt);
+            double avgBps = bytes > 0L ? (bytes * 1000d) / elapsedMs : 0d;
+            double speedBps = smoothedBps > 0d ? smoothedBps : avgBps;
+            long remaining = Math.max(0L, totalBytes - bytes);
+            Double etaSeconds;
+            if (remaining <= 0L) {
+                etaSeconds = Double.valueOf(0d);
+            } else if (speedBps > 0d) {
+                etaSeconds = Double.valueOf(remaining / speedBps);
+            } else {
+                etaSeconds = null;
+            }
+            return new ProgressSnapshot(progressPercent(bytes, totalBytes), speedBps, etaSeconds);
+        }
     }
 
     private static int normalizeChunkSize(int size) {
@@ -982,12 +1184,48 @@ public class FsService {
         }
     }
 
+    private static String createSessionId() {
+        return System.currentTimeMillis() + "-" + UUID.randomUUID();
+    }
+
     private static boolean isWindowsReparsePoint(Path path) {
         try {
             Object v = Files.getAttribute(path, "dos:reparsePoint", LinkOption.NOFOLLOW_LINKS);
             return v instanceof Boolean && (Boolean) v;
         } catch (Exception ignored) {
             return false;
+        }
+    }
+
+    private static String getFileExtension(Path absolutePath) {
+        if (absolutePath == null || absolutePath.getFileName() == null) {
+            return "";
+        }
+        String fileName = absolutePath.getFileName().toString().trim().toLowerCase(java.util.Locale.ROOT);
+        int dot = fileName.lastIndexOf('.');
+        if (dot < 0 || dot == fileName.length() - 1) {
+            return "";
+        }
+        return fileName.substring(dot + 1);
+    }
+
+    private static String formatMb(long sizeInBytes) {
+        double mb = ((double) sizeInBytes) / (1024d * 1024d);
+        return String.format(java.util.Locale.ROOT, "%.2f", mb);
+    }
+
+    private static void ensureGetPolicyAccess(FsPolicy currentPolicy, Path absolutePath, BasicFileAttributes attrs) {
+        String ext = getFileExtension(absolutePath);
+        List<String> allowList = currentPolicy != null ? currentPolicy.getGetAllowedExtensions() : Collections.emptyList();
+        if (ext.isEmpty() || !allowList.contains(ext)) {
+            throw new IllegalArgumentException("get only allows text-like files; extension '." + (ext.isEmpty() ? "unknown" : ext) + "' is not allowed. Please use download().");
+        }
+
+        double maxGetFileMb = currentPolicy != null ? currentPolicy.getMaxGetFileMb() : 0d;
+        long maxGetFileBytes = (long) Math.floor(maxGetFileMb * 1024d * 1024d);
+        long fileSize = attrs != null ? attrs.size() : 0L;
+        if (maxGetFileBytes > 0 && fileSize > maxGetFileBytes) {
+            throw new IllegalArgumentException("file size " + formatMb(fileSize) + "MB exceeds get limit " + formatMb(maxGetFileBytes) + "MB. Please use download().");
         }
     }
 
@@ -1068,21 +1306,25 @@ public class FsService {
     }
 
     private static byte[] readRange(Path path, long offset, int size) throws IOException {
-        byte[] out = new byte[size];
         try (var ch = java.nio.channels.FileChannel.open(path, StandardOpenOption.READ)) {
-            ch.position(offset);
-            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(out);
-            int total = 0;
-            while (buf.hasRemaining()) {
-                int n = ch.read(buf);
-                if (n < 0) break;
-                total += n;
-            }
-            if (total == out.length) {
-                return out;
-            }
-            return Arrays.copyOf(out, Math.max(total, 0));
+            return readRange(ch, offset, size);
         }
+    }
+
+    private static byte[] readRange(java.nio.channels.FileChannel ch, long offset, int size) throws IOException {
+        byte[] out = new byte[size];
+        ch.position(offset);
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(out);
+        int total = 0;
+        while (buf.hasRemaining()) {
+            int n = ch.read(buf);
+            if (n < 0) break;
+            total += n;
+        }
+        if (total == out.length) {
+            return out;
+        }
+        return Arrays.copyOf(out, Math.max(total, 0));
     }
 
     private static BasicFileAttributes lstat(Path p) throws IOException {
