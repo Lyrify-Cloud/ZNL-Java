@@ -49,6 +49,7 @@ public class ZmqClusterNode {
     private final ConcurrentLinkedQueue<QueuedTask> taskQueue = new ConcurrentLinkedQueue<>();
     private final Map<String, PendingRequest> pending = new ConcurrentHashMap<>();
     private String authKey;
+    private final byte[] kdfSalt;
 
     private boolean secureEnabled;
     private SecurityUtils.Keys keys;
@@ -105,6 +106,7 @@ public class ZmqClusterNode {
         this.options = options;
         this.context = new ZContext();
         this.authKey = options.getAuthKey() != null ? options.getAuthKey() : "";
+        this.kdfSalt = options.getKdfSalt();
         
         if ("master".equals(options.getRole()) && options.getAuthKeyMap() != null) {
             for (Map.Entry<String, String> entry : options.getAuthKeyMap().entrySet()) {
@@ -122,7 +124,7 @@ public class ZmqClusterNode {
             }
             try {
                 if (!this.authKey.isEmpty()) {
-                    this.keys = SecurityUtils.deriveKeys(this.authKey);
+                    this.keys = SecurityUtils.deriveKeys(this.authKey, this.kdfSalt);
                 }
             } catch (Exception e) {
                 throw new RuntimeException("Failed to derive keys", e);
@@ -154,7 +156,7 @@ public class ZmqClusterNode {
         
         if (this.secureEnabled) {
             try {
-                SecurityUtils.Keys derived = SecurityUtils.deriveKeys(authKey);
+                SecurityUtils.Keys derived = SecurityUtils.deriveKeys(authKey, this.kdfSalt);
                 this.slaveKeyCache.put(slaveId, derived);
             } catch (Exception e) {
                 logger.error("Failed to derive keys for slave " + slaveId, e);
@@ -188,7 +190,7 @@ public class ZmqClusterNode {
         String key = authKeyMap.get(slaveId);
         if (key != null) {
             try {
-                SecurityUtils.Keys derived = SecurityUtils.deriveKeys(key);
+                SecurityUtils.Keys derived = SecurityUtils.deriveKeys(key, this.kdfSalt);
                 slaveKeyCache.put(slaveId, derived);
                 return derived;
             } catch (Exception e) {
@@ -311,6 +313,7 @@ public class ZmqClusterNode {
     }
 
     private void closeAllSockets() {
+        discardQueuedTasks(new Exception("Node stopped, queued request cancelled."));
         for (PendingRequest req : pending.values()) {
             req.future.completeExceptionally(new Exception("Node stopped, pending request cancelled."));
         }

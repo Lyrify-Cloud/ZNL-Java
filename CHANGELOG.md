@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.3
+
+- 对齐 Node.js ZNL `v0.7.3` 的下载死循环防护：
+  - `master.fs.download()` 在未到 EOF 时收到空分片会立刻失败。
+  - `slave.fs` 下载分片读取在未到 EOF 但 `bytesRead=0` 时立刻失败。
+- 与 `v0.7.3` 保持一致，继续使用精简测试输出策略（Java 侧无 runner 输出模式开关差异）。
+
+## 0.7.2
+
+- 对齐 Node.js ZNL `v0.7.2` 的安全与底层行为更新：
+  - `SecurityUtils.verifyTextSignature()` 改为固定长度缓冲比较，降低长度差异时序暴露。
+  - `fs` 传输会话 ID 生成改为纯 `UUID.randomUUID()`。
+  - 节点停止时会丢弃并回调未发送队列任务，避免请求悬挂。
+
+## 0.7.1
+
+- 对齐 Node.js ZNL `v0.7.1` 的 `kdfSalt` 能力：
+  - `ZmqClusterNodeOptions` 新增 `setKdfSalt(byte[])` / `setKdfSalt(String)`。
+  - `SecurityUtils.deriveKeys(...)` 新增可选 salt 重载，空 salt 回退默认盐。
+  - `ZmqClusterNode` 在构造主密钥、`addAuthKey()` 与 `authKeyMap` 派生路径统一使用 `kdfSalt`。
+
 ## 0.6.8
 
 - 对齐 Node.js ZNL `v0.6.7` / `v0.6.8` 的内建 `fs` 更新。

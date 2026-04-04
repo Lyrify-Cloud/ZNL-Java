@@ -1,9 +1,11 @@
 package com.znl;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 public class ZmqClusterNodeOptions {
     private String role;
@@ -11,6 +13,7 @@ public class ZmqClusterNodeOptions {
     private Map<String, String> endpoints = new HashMap<>();
     private int maxPending = 1000;
     private String authKey = "";
+    private byte[] kdfSalt = null;
     private Map<String, String> authKeyMap = null;
     private int heartbeatInterval = 3000;
     private int heartbeatTimeoutMs = 0;
@@ -37,6 +40,18 @@ public class ZmqClusterNodeOptions {
 
     public String getAuthKey() { return authKey; }
     public void setAuthKey(String authKey) { this.authKey = authKey; }
+
+    public byte[] getKdfSalt() {
+        return kdfSalt != null ? Arrays.copyOf(kdfSalt, kdfSalt.length) : null;
+    }
+
+    public void setKdfSalt(byte[] kdfSalt) {
+        this.kdfSalt = kdfSalt != null ? Arrays.copyOf(kdfSalt, kdfSalt.length) : null;
+    }
+
+    public void setKdfSalt(String kdfSalt) {
+        this.kdfSalt = kdfSalt != null ? kdfSalt.getBytes(StandardCharsets.UTF_8) : null;
+    }
 
     public Map<String, String> getAuthKeyMap() { return authKeyMap; }
     public void setAuthKeyMap(Map<String, String> authKeyMap) { this.authKeyMap = authKeyMap; }

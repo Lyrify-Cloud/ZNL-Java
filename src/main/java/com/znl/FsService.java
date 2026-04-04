@@ -349,6 +349,9 @@ public class FsService {
                     throw new IllegalStateException("download chunk payload missing");
                 }
                 byte[] chunk = resp.body.get(0);
+                if (chunk.length == 0 && offset < fileSize) {
+                    throw new IllegalStateException("download chunk is empty before eof");
+                }
                 ch.position(offset);
                 ch.write(java.nio.ByteBuffer.wrap(chunk));
                 offset += chunk.length;
@@ -951,7 +954,26 @@ public class FsService {
         }
 
         int size = (int) Math.min(s.chunkSize, s.fileSize - offset);
-        byte[] chunk = readRange(s.targetPath, offset, size);
+        if (size <= 0 && offset < s.fileSize) {
+            throw new IllegalArgumentException("download chunk size invalid");
+        }
+
+        byte[] chunk;
+        try (var ch = java.nio.channels.FileChannel.open(s.targetPath, StandardOpenOption.READ)) {
+            ch.position(offset);
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(Math.max(size, 0));
+            int bytesRead = ch.read(buf);
+            if (bytesRead <= 0 && offset < s.fileSize) {
+                throw new IllegalArgumentException("download chunk read failed: bytesRead=0");
+            }
+            if (bytesRead <= 0) {
+                chunk = new byte[0];
+            } else if (bytesRead == size) {
+                chunk = buf.array();
+            } else {
+                chunk = Arrays.copyOf(buf.array(), bytesRead);
+            }
+        }
         int chunkId = (int) toLong(meta.get("chunkId"), 0L);
 
         Map<String, Object> ok = okMeta(OPS_DOWNLOAD_CHUNK);
@@ -1185,7 +1207,7 @@ public class FsService {
     }
 
     private static String createSessionId() {
-        return System.currentTimeMillis() + "-" + UUID.randomUUID();
+        return UUID.randomUUID().toString();
     }
 
     private static boolean isWindowsReparsePoint(Path path) {

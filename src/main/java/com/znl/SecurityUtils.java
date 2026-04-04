@@ -36,11 +36,21 @@ public class SecurityUtils {
     }
 
     public static Keys deriveKeys(String authKey) throws Exception {
+        return deriveKeys(authKey, (byte[]) null);
+    }
+
+    public static Keys deriveKeys(String authKey, String salt) throws Exception {
+        byte[] saltBytes = salt != null ? salt.getBytes(StandardCharsets.UTF_8) : null;
+        return deriveKeys(authKey, saltBytes);
+    }
+
+    public static Keys deriveKeys(String authKey, byte[] saltInput) throws Exception {
         if (authKey == null || authKey.isEmpty()) {
             throw new IllegalArgumentException("authKey cannot be empty when security is enabled.");
         }
         byte[] ikm = authKey.getBytes(StandardCharsets.UTF_8);
-        byte[] salt = KDF_SALT.getBytes(StandardCharsets.UTF_8);
+        byte[] defaultSalt = KDF_SALT.getBytes(StandardCharsets.UTF_8);
+        byte[] salt = (saltInput != null && saltInput.length > 0) ? Arrays.copyOf(saltInput, saltInput.length) : defaultSalt;
         
         byte[] signKey = hkdf(ikm, salt, KDF_INFO_SIGN.getBytes(StandardCharsets.UTF_8), KEY_BYTES);
         byte[] encryptKey = hkdf(ikm, salt, KDF_INFO_ENCRYPT.getBytes(StandardCharsets.UTF_8), KEY_BYTES);
@@ -92,8 +102,13 @@ public class SecurityUtils {
 
     public static boolean verifyTextSignature(byte[] signKey, String text, String signatureHex) {
         try {
-            String expected = signText(signKey, text);
-            return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), signatureHex.getBytes(StandardCharsets.UTF_8));
+            byte[] expected = hexToBytes(signText(signKey, text));
+            byte[] provided = hexToBytes(String.valueOf(signatureHex != null ? signatureHex : ""));
+            byte[] normalized = new byte[expected.length];
+            System.arraycopy(provided, 0, normalized, 0, Math.min(provided.length, expected.length));
+            boolean sameContent = MessageDigest.isEqual(expected, normalized);
+            boolean sameLength = provided.length == expected.length;
+            return sameContent && sameLength;
         } catch (Exception e) {
             return false;
         }
@@ -311,6 +326,26 @@ public class SecurityUtils {
             hexChars[j * 2 + 1] = HEX_ARRAY[v & 0x0F];
         }
         return new String(hexChars);
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        if (hex == null) {
+            return new byte[0];
+        }
+        String text = hex.trim();
+        if ((text.length() & 1) != 0) {
+            throw new IllegalArgumentException("Invalid hex length");
+        }
+        byte[] out = new byte[text.length() / 2];
+        for (int i = 0; i < text.length(); i += 2) {
+            int hi = Character.digit(text.charAt(i), 16);
+            int lo = Character.digit(text.charAt(i + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new IllegalArgumentException("Invalid hex character");
+            }
+            out[i / 2] = (byte) ((hi << 4) + lo);
+        }
+        return out;
     }
 
     private static String escapeJson(String str) {
